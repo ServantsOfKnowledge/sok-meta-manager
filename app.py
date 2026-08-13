@@ -34,6 +34,11 @@ def err(msg, code=400):
 
 
 # ── Background job worker ─────────────────────────────────────────────────────
+# Multiple worker threads run jobs in parallel across DIFFERENT collections
+# (claim_next_job skips collections that already have a running job).  A single
+# collection still gets one sync at a time.
+
+WORKER_THREADS = 3
 
 _worker_started = False
 _worker_lock = threading.Lock()
@@ -45,7 +50,9 @@ def start_job_worker():
         if _worker_started:
             return
         _worker_started = True
-    threading.Thread(target=_worker_loop, daemon=True, name="job-worker").start()
+    for i in range(WORKER_THREADS):
+        threading.Thread(target=_worker_loop, daemon=True,
+                         name=f"job-worker-{i+1}").start()
 
 
 def _worker_loop():
@@ -136,7 +143,18 @@ def _run_sync(job_id, coll_id, params, smart=False):
         return
     include_noindex = bool(params.get("include_noindex"))
     mode = "smart" if smart else ("full-noindex" if include_noindex else "full")
-    _sync_state[coll_id] = {"status": "running", "current": 0, "total": 0,
+    job_row = db.get_job(job_id) or {}
+    start_count   = int(job_row.get("current") or params.get("resume_current") or 0)
+    resume_cursor = params.get("resume_cursor")
+    resume_page   = params.get("resume_page")
+    resuming      = bool(resume_cursor or resume_page)
+    # A sync with no resume marker is a true start-from-scratch run: begin the
+    # progress counter at 0 so it tracks items fetched this run (the portal's
+    # local count already reflects previously stored items).
+    if not resuming:
+        start_count = 0
+
+    _sync_state[coll_id] = {"status": "running", "current": start_count, "total": 0,
                             "new_count": 0, "error": None, "mode": mode,
                             "since": params.get("since"), "job_id": job_id}
 
@@ -151,29 +169,37 @@ def _run_sync(job_id, coll_id, params, smart=False):
         if coll_id in _sync_state:
             _sync_state[coll_id].update({"current": cur, "total": tot})
 
-    try:
-        db.add_job_log(job_id, "info", f"Fetching from IA collection '{coll['identifier']}'")
-        if smart:
-            items = ia_svc.fetch_updated_items(coll["identifier"],
-                                               params.get("since") or coll.get("last_synced"),
-                                               progress)
-        elif include_noindex:
-            items = ia_svc.fetch_collection_all(coll["identifier"], progress)
-        else:
-            items = ia_svc.fetch_collection_items(coll["identifier"], progress)
+    def save_cursor(cursor):
+        db.set_job_resume(job_id, "resume_cursor", cursor)
 
-        n = 0
-        for i, item in enumerate(items):
-            if db.job_cancel_requested(job_id):
-                db.finish_job(job_id, "cancelled")
-                db.add_job_log(job_id, "warn", "Cancelled by user")
-                _sync_state.pop(coll_id, None)
-                return
+    def save_page(page):
+        db.set_job_resume(job_id, "resume_page", page)
+
+    try:
+        db.add_job_log(job_id, "info",
+                       f"Fetching from IA collection '{coll['identifier']}'"
+                       + (" (resuming from saved position)" if resuming else ""))
+        if smart:
+            items = ia_svc.fetch_updated_items(
+                coll["identifier"], params.get("since") or coll.get("last_synced"),
+                progress, start_cursor=resume_cursor, cursor_callback=save_cursor,
+                start_count=start_count)
+        elif include_noindex:
+            items = ia_svc.fetch_collection_all(
+                coll["identifier"], progress, start_cursor=resume_cursor,
+                cursor_callback=save_cursor, start_count=start_count)
+        else:
+            items = ia_svc.fetch_collection_items(
+                coll["identifier"], progress, start_page=resume_page,
+                page_callback=save_page, start_count=start_count)
+
+        # Stream: persist each item as it arrives so the portal updates live.
+        # Cancellation is honoured via the progress callback raising JobCancelled.
+        n = start_count
+        for item in items:
             if item.get("identifier"):
                 db.upsert_item(coll_id, item["identifier"], item, ia_raw=item)
                 n += 1
-            if i % 25 == 0:
-                progress(i + 1, len(items))
 
         db.update_collection_sync(coll_id, db.get_stats(coll_id)["total"])
         _sync_done(job_id, coll_id, n, f"Synced {n} item(s) from '{coll['identifier']}'")
@@ -408,7 +434,8 @@ def api_delete_collection(coll_id):
 
 @app.route("/api/collections/<int:coll_id>/stats")
 def api_collection_stats(coll_id):
-    return ok(db.get_stats(coll_id))
+    ia_coll = request.args.get("ia_collection") or None
+    return ok(db.get_stats(coll_id, ia_coll))
 
 
 # ── Sync & background jobs ────────────────────────────────────────────────────
@@ -436,8 +463,18 @@ def api_sync_collection(coll_id):
     body = request.get_json(silent=True) or {}
     include_noindex = bool(body.get("include_noindex", False))
     mode = "full-noindex" if include_noindex else "full"
+    # Only one pending full sync per collection: supersede older queued ones
+    db.cancel_queued_syncs(coll_id, "full-sync")
+    params = {"include_noindex": include_noindex}
+    # Resume from the most recent failed sync of the same type if available
+    resume = db.latest_sync_resume(coll_id, "full-sync", include_noindex=include_noindex)
+    if resume:
+        for k in ("resume_cursor", "resume_page"):
+            if k in resume:
+                params[k] = resume[k]
+        params["resume_current"] = resume.get("current", 0)
     job_id = db.create_job(
-        "full-sync", coll_id, {"include_noindex": include_noindex},
+        "full-sync", coll_id, params,
         title=f"Full sync · {coll['name']} · {'incl. hidden' if include_noindex else 'public'}",
     )
     _sync_state[coll_id] = {"status": "queued", "current": 0, "total": 0,
@@ -458,8 +495,18 @@ def api_smart_sync(coll_id):
         return err("Collection not found", 404)
     body  = request.get_json(silent=True) or {}
     since = body.get("since") or coll.get("last_synced")
+    # Only one pending smart sync per collection: supersede older queued ones
+    db.cancel_queued_syncs(coll_id, "smart-sync")
+    params = {"since": since, "include_noindex": body.get("include_noindex", False)}
+    # Resume from the most recent failed sync of the same type if available
+    resume = db.latest_sync_resume(coll_id, "smart-sync")
+    if resume:
+        for k in ("resume_cursor", "resume_page"):
+            if k in resume:
+                params[k] = resume[k]
+        params["resume_current"] = resume.get("current", 0)
     job_id = db.create_job(
-        "smart-sync", coll_id, {"since": since, "include_noindex": body.get("include_noindex", False)},
+        "smart-sync", coll_id, params,
         title=f"Smart sync · {coll['name']}",
     )
     _sync_state[coll_id] = {"status": "queued", "current": 0, "total": 0,
@@ -712,6 +759,42 @@ def api_bulk_collection(coll_id):
     return ok({"job_id": job_id, "matched": matched}), 202
 
 
+@app.route("/api/collections/<int:coll_id>/items/bulk-fields", methods=["POST"])
+def api_bulk_fields_by_ids(coll_id):
+    """
+    Apply metadata field edits (subject, publisher, …) to an explicit list of
+    item ids (checkbox selection on the listing page). Body: {ids, fields}.
+    """
+    coll = db.get_collection(coll_id)
+    if not coll:
+        return err("Collection not found", 404)
+    body   = request.get_json(silent=True) or {}
+    ids    = body.get("ids") or []
+    fields = body.get("fields") or {}
+    if not isinstance(ids, list) or not ids:
+        return err("ids (array of item ids) is required")
+    if not isinstance(fields, dict) or not fields:
+        return err("fields cannot be empty")
+    try:
+        count = db.bulk_update_by_ids(coll_id, [int(i) for i in ids], fields)
+    except Exception as e:
+        return err(f"Update failed: {e}")
+    return ok({"updated_count": count})
+
+
+@app.route("/api/collections/<int:coll_id>/collections")
+def api_collection_names(coll_id):
+    """List the IA collections these items belong to, with item counts,
+    ordered by population. Query params: min_count (default 2), limit
+    (default 500) to drop one-off per-item collections."""
+    try:
+        min_count = int(request.args.get("min_count", 2))
+        limit     = int(request.args.get("limit", 500))
+    except ValueError:
+        return err("min_count and limit must be integers")
+    return ok(db.get_collection_names(coll_id, min_count=min_count, limit=limit))
+
+
 # ── Push to IA ────────────────────────────────────────────────────────────────
 
 PUSHABLE = [
@@ -778,8 +861,13 @@ def api_remove_item_from_collection(item_id, cname):
 
 @app.route("/api/collections/<int:coll_id>/languages")
 def api_languages(coll_id):
-    """Language breakdown with transliteration stage counts."""
-    breakdown = db.get_language_breakdown(coll_id)
+    """Language breakdown with transliteration stage counts, scoped to the
+    active sub-collection and/or the Modified tab."""
+    breakdown = db.get_language_breakdown(
+        coll_id,
+        ia_collection=request.args.get("ia_collection") or None,
+        modified_only=request.args.get("modified_only", "false").lower() == "true",
+    )
     for lang in breakdown:
         lang["label"] = T.get_language_label(lang["code"])
         lang["is_indian"] = T.is_indian(lang["code"])

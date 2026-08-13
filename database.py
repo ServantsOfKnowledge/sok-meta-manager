@@ -35,9 +35,10 @@ ID_OFFSET     = 100_000_000   # max items per collection before ids collide
 
 def get_db():
     """Open the catalog DB (collections, jobs, sub-collections, meta)."""
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=30000")
     conn.execute("PRAGMA foreign_keys=ON")
     return conn
 
@@ -233,9 +234,10 @@ def _init_coll_conn(conn, identifier):
 
 def get_coll_db_conn(identifier):
     """Open (creating if needed) the per-collection DB for an identifier."""
-    conn = sqlite3.connect(_coll_path(identifier))
+    conn = sqlite3.connect(_coll_path(identifier), timeout=30)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=30000")
     conn.execute("PRAGMA foreign_keys=ON")
     _init_coll_conn(conn, identifier)
     return conn
@@ -692,6 +694,12 @@ def _build_selection_sql(selection):
     where, params = [], []
     if selection.get("match_all"):
         return where, params
+    ids = selection.get("ids")
+    if isinstance(ids, (list, tuple)) and ids:
+        ids = [int(x) for x in ids]
+        where.append("i.id IN (" + ",".join("?" * len(ids)) + ")")
+        params.extend(ids)
+        return where, params
     match_field = (selection.get("match_field") or "").strip()
     if match_field and selection.get("match_pattern"):
         pattern = selection["match_pattern"]
@@ -934,6 +942,48 @@ def bulk_update(collection_id, match_field, match_pattern,
         conn.close()
 
 
+def bulk_update_by_ids(collection_id, ids, fields: dict):
+    """Apply field updates to an explicit list of item ids (checkbox selection)."""
+    conn = get_coll_db(collection_id)
+    try:
+        updated = 0
+        for row in conn.execute(
+            "SELECT id FROM items WHERE id IN (" + ",".join("?" * len(ids)) + ")",
+            list(ids),
+        ).fetchall():
+            if update_item_fields(row["id"], fields):
+                updated += 1
+        _dirty_coll(collection_id)
+        return updated
+    finally:
+        conn.close()
+
+
+def get_collection_names(collection_id, min_count=2, limit=500):
+    """List the IA collections present in this collection's items, with counts,
+    ordered by population. Used to answer 'which collections are the items
+    available in'. Small/one-off collections (unique per-item collections) are
+    excluded via min_count so the list stays useful."""
+    key = ("collnames", collection_id, min_count, limit)
+    cached = cache_get(key)
+    if cached is not None:
+        return cached
+    conn = get_coll_db(collection_id)
+    try:
+        rows = conn.execute(
+            "SELECT collection AS name, COUNT(DISTINCT item_id) AS count "
+            "FROM item_collections "
+            "GROUP BY collection HAVING COUNT(DISTINCT item_id)>=? "
+            "ORDER BY count DESC, name LIMIT ?",
+            (min_count, limit),
+        ).fetchall()
+        out = [dict(r) for r in rows]
+    finally:
+        conn.close()
+    cache_put(key, out, 4)
+    return out
+
+
 def get_item_changes(item_id):
     coll_id = _coll_id_from_item_id(item_id)
     conn = get_coll_db(coll_id)
@@ -976,18 +1026,31 @@ def get_modified_items(collection_id):
         conn.close()
 
 
-def get_stats(collection_id):
-    key = ("stats", collection_id)
+def get_stats(collection_id, ia_collection=None):
+    key = ("stats", collection_id, ia_collection)
     cached = cache_get(key)
     if cached is not None:
         return cached
     conn = get_coll_db(collection_id)
     try:
-        total    = conn.execute("SELECT COUNT(*) FROM items").fetchone()[0]
-        modified = conn.execute(
-            "SELECT COUNT(*) FROM items WHERE is_modified=1").fetchone()[0]
-        pushed   = conn.execute(
-            "SELECT COUNT(*) FROM items WHERE is_pushed=1").fetchone()[0]
+        if ia_collection:
+            sub_where = ("i.id IN (SELECT item_id FROM item_collections "
+                         "WHERE collection=?)")
+            total    = conn.execute(
+                f"SELECT COUNT(*) FROM items i WHERE {sub_where}",
+                (ia_collection,)).fetchone()[0]
+            modified = conn.execute(
+                f"SELECT COUNT(*) FROM items i WHERE i.is_modified=1 AND {sub_where}",
+                (ia_collection,)).fetchone()[0]
+            pushed   = conn.execute(
+                f"SELECT COUNT(*) FROM items i WHERE i.is_pushed=1 AND {sub_where}",
+                (ia_collection,)).fetchone()[0]
+        else:
+            total    = conn.execute("SELECT COUNT(*) FROM items").fetchone()[0]
+            modified = conn.execute(
+                "SELECT COUNT(*) FROM items WHERE is_modified=1").fetchone()[0]
+            pushed   = conn.execute(
+                "SELECT COUNT(*) FROM items WHERE is_pushed=1").fetchone()[0]
     finally:
         conn.close()
     out = {"total": total, "modified": modified, "pushed": pushed,
@@ -998,16 +1061,27 @@ def get_stats(collection_id):
 
 # ── Language & transliteration (per-collection DB) ───────────────────────────
 
-def get_language_breakdown(collection_id):
-    key = ("lang", collection_id)
+def get_language_breakdown(collection_id, ia_collection=None, modified_only=False):
+    key = ("lang", collection_id, ia_collection or "", bool(modified_only))
     cached = cache_get(key)
     if cached is not None:
         return cached
     conn = get_coll_db(collection_id)
     try:
+        where, params = [], []
+        if ia_collection:
+            where.append(
+                "id IN (SELECT item_id FROM item_collections WHERE collection=?)"
+            )
+            params.append(ia_collection)
+        if modified_only:
+            where.append("is_modified=1")
+        where_sql = (" WHERE " + " AND ".join(where)) if where else ""
         rows = conn.execute(
-            """SELECT detected_language, translit_status, COUNT(*) as cnt
-               FROM items GROUP BY detected_language, translit_status"""
+            f"""SELECT detected_language, translit_status, COUNT(*) as cnt
+                FROM items{where_sql}
+                GROUP BY detected_language, translit_status""",
+            params,
         ).fetchall()
     finally:
         conn.close()
@@ -1241,11 +1315,16 @@ def create_job(job_type, collection_id=None, params=None, title=""):
 
 
 def claim_next_job():
+    """Claim the oldest queued job whose collection has no job already running.
+    This lets multiple worker threads sync DIFFERENT collections in parallel
+    while guaranteeing a collection is never synced by two workers at once."""
     conn = get_db()
     try:
         conn.execute("BEGIN IMMEDIATE")
         row = conn.execute(
             "SELECT * FROM jobs WHERE status='queued' AND cancel_requested=0 "
+            "AND collection_id NOT IN ("
+            "  SELECT collection_id FROM jobs WHERE status='running') "
             "ORDER BY id LIMIT 1"
         ).fetchone()
         if not row:
@@ -1257,6 +1336,65 @@ def claim_next_job():
         )
         conn.commit()
         return dict(row)
+    finally:
+        conn.close()
+
+
+def set_job_resume(job_id, key, value):
+    """Persist a resume marker (scrape cursor / page number) on a job's params
+    so an interrupted sync can continue where it left off after a restart."""
+    conn = get_db()
+    try:
+        row = conn.execute("SELECT params FROM jobs WHERE id=?", (job_id,)).fetchone()
+        params = {}
+        if row and row["params"]:
+            try:
+                params = json.loads(row["params"])
+            except Exception:
+                params = {}
+        params[key] = value
+        conn.execute("UPDATE jobs SET params=? WHERE id=?", (json.dumps(params), job_id))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def latest_sync_resume(coll_id, job_type, include_noindex=None):
+    """Return resume markers from the most recent failed/interrupted sync of the
+    same type, so a freshly queued sync can continue instead of repeating work
+    already done.  Returns {'current','resume_cursor','resume_page'} or None."""
+    conn = get_db()
+    try:
+        if include_noindex is None:
+            rows = conn.execute(
+                "SELECT params, current FROM jobs "
+                "WHERE collection_id=? AND job_type=? AND status IN ('error','interrupted','cancelled') "
+                "ORDER BY id DESC LIMIT 20",
+                (coll_id, job_type),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT params, current FROM jobs "
+                "WHERE collection_id=? AND job_type=? AND status IN ('error','interrupted','cancelled') "
+                "AND json_extract(params,'$.include_noindex')=? "
+                "ORDER BY id DESC LIMIT 20",
+                (coll_id, job_type, 1 if include_noindex else 0),
+            ).fetchall()
+        for row in rows:
+            params = {}
+            if row["params"]:
+                try:
+                    params = json.loads(row["params"])
+                except Exception:
+                    params = {}
+            out = {"current": int(row["current"] or 0)}
+            if params.get("resume_cursor"):
+                out["resume_cursor"] = params["resume_cursor"]
+            if params.get("resume_page"):
+                out["resume_page"] = params["resume_page"]
+            if "resume_cursor" in out or "resume_page" in out:
+                return out
+        return None
     finally:
         conn.close()
 
@@ -1426,6 +1564,79 @@ def mark_interrupted_jobs():
             "error=COALESCE(error, 'interrupted by restart'), "
             "finished_at=datetime('now') WHERE status='running'"
         )
+        conn.commit()
+        # Resumable syncs continue from their saved cursor after a restart
+        # instead of repeating work already done.  Other job types stay
+        # 'interrupted' (re-run them manually).  Jobs the user cancelled
+        # (cancel_requested=1) are never resumed.  For each (collection, sync
+        # type) only ONE job is re-queued: the newest that has a saved resume
+        # marker if any exists, otherwise the newest overall — so a restart
+        # never leaves multiple competing syncs running for one collection.
+        rows = conn.execute(
+            "SELECT id, collection_id, job_type, params FROM jobs "
+            "WHERE status='interrupted' AND cancel_requested=0 "
+            "AND job_type IN ('full-sync','smart-sync') "
+            "ORDER BY id"
+        ).fetchall()
+
+        def has_resume(params_json):
+            try:
+                p = json.loads(params_json or "{}")
+            except Exception:
+                p = {}
+            return bool(p.get("resume_cursor") or p.get("resume_page"))
+
+        best = {}  # (coll_id, job_type) -> [id, has_resume_marker]
+        for r in rows:
+            key = (r["collection_id"], r["job_type"])
+            seen = best.get(key)
+            if seen is None:
+                best[key] = [r["id"], has_resume(r["params"])]
+                continue
+            cur_has = seen[1]
+            new_has = has_resume(r["params"])
+            if new_has and not cur_has:
+                best[key] = [r["id"], True]
+            elif new_has == cur_has and r["id"] > seen[0]:
+                best[key] = [r["id"], new_has]
+        resume_ids = [b[0] for b in best.values()]
+        if resume_ids:
+            conn.executemany(
+                "UPDATE jobs SET status='queued', started_at=NULL, finished_at=NULL, "
+                "error=NULL, cancel_requested=0 WHERE id=?",
+                [(i,) for i in resume_ids],
+            )
+        # Cancel any other sync still queued for the same (collection, type) —
+        # including ones that were already queued before the restart — so a
+        # restart never leaves two competing syncs pending for one collection.
+        for (coll_id, job_type), chosen in best.items():
+            conn.execute(
+                "UPDATE jobs SET status='cancelled', finished_at=datetime('now') "
+                "WHERE status='queued' AND collection_id=? AND job_type=? AND id<>?",
+                (coll_id, job_type, chosen[0]),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def cancel_queued_syncs(collection_id, job_type=None):
+    """Cancel queued sync/other jobs for a collection so a freshly queued job
+    does not compete with an older pending one of the same type."""
+    conn = get_db()
+    try:
+        if job_type:
+            conn.execute(
+                "UPDATE jobs SET status='cancelled', finished_at=datetime('now') "
+                "WHERE status='queued' AND collection_id=? AND job_type=?",
+                (collection_id, job_type),
+            )
+        else:
+            conn.execute(
+                "UPDATE jobs SET status='cancelled', finished_at=datetime('now') "
+                "WHERE status='queued' AND collection_id=?",
+                (collection_id,),
+            )
         conn.commit()
     finally:
         conn.close()

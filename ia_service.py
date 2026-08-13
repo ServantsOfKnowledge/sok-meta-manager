@@ -45,38 +45,81 @@ SEARCH_FIELDS = [
 def fetch_collection_items(
     collection_identifier: str,
     progress_callback: Optional[Callable] = None,
-) -> list:
-    """Fetch ALL items in a collection (full sync)."""
+    start_page: Optional[int] = None,
+    page_callback: Optional[Callable] = None,
+    start_count: int = 0,
+):
+    """Fetch ALL items in a collection (full sync, public search API).  Streams
+    each item via yield as it is retrieved so the caller can persist records
+    incrementally.  Resumable: pass a previously saved ``start_page`` to
+    continue where a previous run left off; ``page_callback`` receives the next
+    page number after each page so the caller can persist it."""
     if not IA_LIB_AVAILABLE:
         raise RuntimeError("internetarchive library not installed")
 
-    query  = f"collection:{collection_identifier}"
-    search = ia.search_items(query, fields=SEARCH_FIELDS)
-    total  = search.num_found
-    results = []
+    query = f"collection:{collection_identifier}"
+    page  = int(start_page or 1)
+    i     = start_count or 0
 
-    for i, result in enumerate(search):
-        item_meta = _parse_result(result)
-        results.append(item_meta)
-        if progress_callback:
-            progress_callback(i + 1, total)
-        time.sleep(0.1)   # polite rate limiting
+    while True:
+        search = ia.search_items(
+            query, fields=SEARCH_FIELDS, params={"page": page, "rows": 500}
+        )
+        total = search.num_found
+        n_items = 0
+        for result in search.iter_as_results():
+            i += 1
+            n_items += 1
+            if progress_callback:
+                progress_callback(i, total or i)
+            time.sleep(0.1)   # polite rate limiting
+            yield _parse_result(result)
 
-    return results
+        if n_items == 0:
+            break
+        if page_callback:
+            page_callback(page + 1)
+        page += 1
+
+
+def _scrape_page(session, params, timeout=90, attempts=4):
+    """GET one page of the IA scrape API, retrying transient network/DNS
+    errors with backoff so a single blip doesn't abort an entire sync."""
+    last_err = None
+    for attempt in range(attempts):
+        try:
+            resp = session.get(
+                "https://archive.org/services/search/v1/scrape",
+                params=params,
+                timeout=timeout,
+            )
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            last_err = e
+            time.sleep(2 * (attempt + 1))
+    raise RuntimeError(f"Scrape API error: {last_err}")
 
 
 def fetch_updated_items(
     collection_identifier: str,
     since_date: Optional[str],
     progress_callback: Optional[Callable] = None,
-) -> list:
+    start_cursor: Optional[str] = None,
+    cursor_callback: Optional[Callable] = None,
+    start_count: int = 0,
+):
     """
-    Smart incremental sync: only fetch items updated on IA after since_date.
+    Smart incremental sync: fetch only items updated on IA after since_date.
     since_date should be an ISO date string like "2024-01-15T10:30:00".
     Falls back to full sync if since_date is None.
 
     Uses the authenticated scrape API (same as fetch_collection_all) so that
     hidden/noindex items are included and authentication errors surface clearly.
+    Streams each item via yield as it is retrieved so the caller can persist
+    records incrementally (portal updates on the fly).  Resumable: pass a
+    previously saved ``start_cursor`` to continue where a previous run left
+    off; ``cursor_callback`` is invoked with the next cursor after each page.
     """
     if not IA_LIB_AVAILABLE:
         raise RuntimeError("internetarchive library not installed")
@@ -92,7 +135,9 @@ def fetch_updated_items(
         query = f"collection:{collection_identifier}"
 
     session = _get_session()
-    results, cursor, total = [], None, None
+    cursor = start_cursor
+    total  = None
+    count  = start_count or 0
     fields_str = ",".join(SEARCH_FIELDS)
 
     while True:
@@ -104,34 +149,26 @@ def fetch_updated_items(
         if cursor:
             params["cursor"] = cursor
 
-        try:
-            resp = session.get(
-                "https://archive.org/services/search/v1/scrape",
-                params=params,
-                timeout=90,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-        except Exception as e:
-            raise RuntimeError(f"Smart sync scrape error: {e}")
+        data = _scrape_page(session, params)
 
         if total is None:
             total = data.get("total", 0)
 
         page_items = data.get("items", [])
         for item in page_items:
-            results.append(_parse_result(item))
-
-        if progress_callback:
-            progress_callback(len(results), total or len(results))
+            count += 1
+            if progress_callback:
+                progress_callback(count, total or count)
+            yield _parse_result(item)
 
         cursor = data.get("cursor")
+        if cursor_callback and cursor:
+            cursor_callback(cursor)
+
         if not cursor or not page_items:
             break
 
         time.sleep(0.1)
-
-    return results
 
 
 def _parse_result(result: dict) -> dict:
@@ -162,17 +199,26 @@ def _get_session():
 def fetch_collection_all(
     collection_identifier: str,
     progress_callback: Optional[Callable] = None,
-) -> list:
+    start_cursor: Optional[str] = None,
+    cursor_callback: Optional[Callable] = None,
+    start_count: int = 0,
+):
     """
     Fetch ALL items in a collection using IA's authenticated scrape API.
     Unlike the regular search, this includes noindex/hidden items visible
     to the logged-in account (requires `ia configure` with valid credentials).
+    Streams each item via yield as it is retrieved so the caller can persist
+    records incrementally (portal updates on the fly).  Resumable: pass a
+    previously saved ``start_cursor`` to continue where a previous run left
+    off; ``cursor_callback`` is invoked with the next cursor after each page.
     """
     if not IA_LIB_AVAILABLE:
         raise RuntimeError("internetarchive library not installed")
 
     session = _get_session()
-    results, cursor, total = [], None, None
+    cursor = start_cursor
+    total  = None
+    count  = start_count or 0
     fields_str = ",".join(SEARCH_FIELDS)
 
     while True:
@@ -184,34 +230,26 @@ def fetch_collection_all(
         if cursor:
             params["cursor"] = cursor
 
-        try:
-            resp = session.get(
-                "https://archive.org/services/search/v1/scrape",
-                params=params,
-                timeout=90,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-        except Exception as e:
-            raise RuntimeError(f"Scrape API error: {e}")
+        data = _scrape_page(session, params)
 
         if total is None:
             total = data.get("total", 0)
 
         page_items = data.get("items", [])
         for item in page_items:
-            results.append(_parse_result(item))
-
-        if progress_callback:
-            progress_callback(len(results), total or len(results))
+            count += 1
+            if progress_callback:
+                progress_callback(count, total or count)
+            yield _parse_result(item)
 
         cursor = data.get("cursor")
+        if cursor_callback and cursor:
+            cursor_callback(cursor)
+
         if not cursor or not page_items:
             break
 
         time.sleep(0.1)
-
-    return results
 
 
 # ── Sub-collection discovery ──────────────────────────────────────────────────

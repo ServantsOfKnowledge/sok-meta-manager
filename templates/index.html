@@ -543,6 +543,9 @@ th.sorted .th-sort{opacity:1;}
       <select class="f-select" id="lang-filter" onchange="applyFilters()">
         <option value="">All Languages</option>
       </select>
+      <select class="f-select" id="coll-filter" onchange="applyCollFilter()">
+        <option value="">All Collections</option>
+      </select>
       <select class="f-select" id="tstatus-filter" onchange="applyFilters()">
         <option value="">All Translit Status</option>
         <option value="none">None</option>
@@ -571,10 +574,22 @@ th.sorted .th-sort{opacity:1;}
 
     <!-- Sub: Items table -->
     <div id="sub-items" style="display:flex;flex-direction:column;flex:1;min-height:0;">
+      <div id="sel-bar" style="display:none;padding:8px 12px;background:var(--bg2);border:1px solid var(--border);border-bottom:none;gap:10px;align-items:center;flex-wrap:wrap;">
+        <strong id="sel-count" style="font-size:13px;">0 selected</strong>
+        <select id="sel-field" class="input" style="width:auto">${''}</select>
+        <input id="sel-value" class="input" style="width:180px" placeholder="New value…">
+        <button class="btn btn-primary btn-sm" onclick="applySelFields()">✏ Apply to selected</button>
+        <span style="color:var(--text3);font-size:12px;">| Collection:</span>
+        <input id="sel-coll" class="input" style="width:180px" placeholder="IA collection identifier">
+        <button class="btn btn-secondary btn-sm" onclick="bulkSelCollection('add')">➕ Add</button>
+        <button class="btn btn-ghost btn-sm" onclick="bulkSelCollection('remove')">➖ Remove</button>
+        <button class="btn btn-ghost btn-sm" onclick="clearSel()">✕ Clear</button>
+      </div>
       <div class="table-wrap" id="table-wrap">
         <table>
           <thead>
             <tr>
+              <th style="width:30px"><input type="checkbox" id="sel-all" onchange="toggleSelAll(this.checked)" title="Select all on this page"></th>
               <th style="width:50px">Thumb</th>
               <th class="sortable" onclick="setSort('title')" id="th-title">Title <span class="th-sort">↕</span></th>
               <th class="sortable" onclick="setSort('creator')" id="th-creator">Creator <span class="th-sort">↕</span></th>
@@ -582,6 +597,7 @@ th.sorted .th-sort{opacity:1;}
               <th style="width:78px">Language</th>
               <th style="width:88px">Translit</th>
               <th style="width:56px">Status</th>
+              <th>Collections</th>
               <th style="width:38px"></th>
             </tr>
           </thead>
@@ -878,6 +894,7 @@ const S = {
   langData:         [],
   importData:       null,
   bulkRowCount:     0,
+  sel:              new Set(),
 };
 
 const META_FIELDS = [
@@ -888,6 +905,7 @@ const META_FIELDS = [
 const INDIAN_CODES = new Set(['kan','tel','tam','mal','hin','san','mar','ben','guj','pan','ori','urd','asm','kok','tcy']);
 const BULK_FIELDS  = ['title','alt_title','creator','alt_creator','author','alt_author',
   'publisher','alt_publisher','date','year','language','subject','licenseurl','mediatype','volume','isbn','source','notes'];
+const MATCH_FIELDS = ['identifier', ...BULK_FIELDS];
 
 // ══════════════════════════════════════════════════════════
 //  INIT
@@ -898,6 +916,7 @@ document.addEventListener('DOMContentLoaded', () => {
   buildBulkFields();
   buildBcFields();
   refreshJobBadges();
+  startKeepFresh();
   setInterval(checkStatus, 30000);
 });
 
@@ -964,7 +983,7 @@ function renderSidebar() {
     const subItems = (c.sub_collections || []).map(sub => {
       const subActive = isActive && S.activeIaColl === sub.ia_id;
       return `<div class="sub-item ${subActive?'active':''}"
-                   onclick="selectSubCollection(${JSON.stringify(c)}, ${JSON.stringify(sub.ia_id)}, ${JSON.stringify(sub.name)})"
+                   onclick="selectSubCollectionById(${c.id}, ${sub.id})"
                    title="${esc(sub.ia_id)}">
         <span>📁</span>
         <span class="si-name">${esc(sub.name||sub.ia_id)}</span>
@@ -975,7 +994,7 @@ function renderSidebar() {
     return `
     <div class="super-coll" id="sc-${c.id}">
       <div class="super-coll-hdr ${isActive&&!S.activeIaColl?'active':''} ${isExpanded?'expanded':''}"
-           onclick="toggleSuper(event, ${c.id}, ${JSON.stringify(c)})">
+           onclick="toggleSuper(event, ${c.id})">
         <span class="sc-arrow">▶</span>
         <span class="sc-name" title="${esc(c.identifier)}">${esc(c.name)}</span>
         <span class="sc-count">${c.local_count||c.item_count||0}</span>
@@ -1015,7 +1034,9 @@ async function quickSync(collId) {
   await syncSmart();
 }
 
-function toggleSuper(event, collId, coll) {
+function toggleSuper(event, collId) {
+  const coll = S.collTree.find(c=>c.id===collId);
+  if (!coll) return;
   // If clicking on the header row itself (not buttons), toggle expand AND select
   const hdr = event.currentTarget;
   hdr.classList.toggle('expanded');
@@ -1041,6 +1062,7 @@ async function selectCollection(coll) {
   updateCollMeta();
   buildLangFilter();
   buildExportLangSelect();
+  loadCollFilter();
 }
 
 function selectSubCollection(superColl, iaId, name) {
@@ -1052,6 +1074,7 @@ function selectSubCollection(superColl, iaId, name) {
   S.activeIaColl     = iaId;
   S.activeIaCollName = name || iaId;
   S.page = 1;
+  document.getElementById('coll-title').textContent = S.activeIaCollName;
   // Show context bar
   document.getElementById('sub-context-label').textContent =
     `Showing: ${S.activeIaCollName}  (sub-collection of ${superColl.name})`;
@@ -1061,24 +1084,39 @@ function selectSubCollection(superColl, iaId, name) {
   setTab(document.querySelector('.tab[data-tab="all"]'), 'all');
   Promise.all([loadItems(), loadLanguages()]);
   updateCollMeta();
+  const cf = document.getElementById('coll-filter');
+  if (cf) cf.value = iaId;
+}
+
+function selectSubCollectionById(superId, subId) {
+  const superColl = S.collTree.find(c=>c.id===superId);
+  if (!superColl) return;
+  const sub = (superColl.sub_collections||[]).find(s=>s.id===subId);
+  if (!sub) return;
+  selectSubCollection(superColl, sub.ia_id, sub.name);
 }
 
 function clearSubCollection() {
   S.activeIaColl     = null;
   S.activeIaCollName = '';
   document.getElementById('sub-context-bar').classList.remove('show');
+  if (S.activeColl) document.getElementById('coll-title').textContent = S.activeColl.name;
+  const cf = document.getElementById('coll-filter');
+  if (cf) cf.value = '';
   renderSidebar();
   S.page = 1;
   loadItems();
+  updateCollMeta();
 }
 
 async function updateCollMeta() {
   if (!S.activeColl) return;
   try {
-    const r = await api(`/api/collections/${S.activeColl.id}/stats`);
+    const q = S.activeIaColl ? `?ia_collection=${encodeURIComponent(S.activeIaColl)}` : '';
+    const r = await api(`/api/collections/${S.activeColl.id}/stats${q}`);
     const s = r.data;
     document.getElementById('coll-meta').textContent =
-      `${s.total} items · ${s.modified} modified · ${s.pushed} pushed · Last sync: ${S.activeColl.last_synced||'Never'}`;
+      `${s.total.toLocaleString()} items · ${s.modified} modified · ${s.pushed} pushed · Last sync: ${S.activeColl.last_synced||'Never'}`;
   } catch(e){}
 }
 
@@ -1198,12 +1236,50 @@ function startLiveNumbers() {
       }
       renderSidebar();
       refreshJobBadges();
+      // Stream sync results into the portal on the fly
+      if (S.activeColl?.id != null &&
+          document.getElementById('view-items')?.classList.contains('active')) {
+        await loadItems(isModifiedTab());
+      }
     } catch(e) { /* transient */ }
   }, 2000);
 }
 function stopLiveNumbers() {
   clearInterval(_liveCounter);
   _liveCounter = null;
+}
+
+// ══════════════════════════════════════════════════════════
+//  GLOBAL KEEP-FRESH — continuous live updates for shared/multi-user use
+// ══════════════════════════════════════════════════════════
+let _keepFreshTimer = null;
+function startKeepFresh() {
+  if (_keepFreshTimer) return;
+  _keepFreshTimer = setInterval(keepFresh, 5000);
+}
+async function keepFresh() {
+  // A running job's live updater already streams everything — skip to avoid
+  // double-fetching and DB lock contention with the background worker.
+  if (_liveCounter) return;
+  try {
+    const r = await fetch('/api/collections/tree');
+    const j = await r.json();
+    if (!j.ok || !j.data) return;
+    S.collTree = j.data;
+    S.collections = j.data;
+    if (S.activeColl?.id != null) {
+      const found = j.data.find(c=>c.id===S.activeColl.id);
+      if (found) { S.activeColl = found; await updateCollMeta(); }
+    }
+    renderSidebar();
+    refreshJobBadges();
+    // Refresh the visible item list, unless the detail editor is open.
+    if (S.activeColl?.id != null &&
+        !S.activeItem &&
+        document.getElementById('view-items')?.classList.contains('active')) {
+      await loadItems(isModifiedTab());
+    }
+  } catch(e) { /* transient */ }
 }
 
 // ══════════════════════════════════════════════════════════
@@ -1221,6 +1297,7 @@ function setTab(el, tab) {
   if (tab==='all' || tab==='modified') {
     document.getElementById('sub-items').style.display='flex';
     document.getElementById('sub-items').style.flexDirection='column';
+    loadLanguages();
     if (tab==='modified') {
       // force modified_only
       S.page=1; loadItems(true);
@@ -1302,6 +1379,7 @@ async function loadItems(modifiedOnly=false) {
   S.items = r.data.items;
   renderItems();
   renderPagination(r.data.total, r.data.page, r.data.per_page);
+  updateSelBar();
   document.getElementById('status-bar').textContent =
     `${r.data.total} item(s) · page ${r.data.page} of ${Math.ceil(r.data.total/r.data.per_page)||1}`;
 }
@@ -1320,6 +1398,10 @@ function renderItems() {
   empty.style.display='none';
   tbody.innerHTML = S.items.map(item => `
     <tr class="${item.is_modified?'modified':''}" onclick="openDetail(${item.id})" style="cursor:pointer;">
+      <td onclick="event.stopPropagation()">
+        <input type="checkbox" class="sel-check" data-id="${item.id}" ${S.sel.has(item.id)?'checked':''}
+               onchange="toggleSel(${item.id}, this.checked)">
+      </td>
       <td class="thumb-cell">
         <div class="thumb-ph" id="th-${item.id}">📖</div>
       </td>
@@ -1333,6 +1415,7 @@ function renderItems() {
       <td>${item.detected_language ? `<span class="chip ${INDIAN_CODES.has(item.detected_language)?'indian':''}">${esc(item.detected_language)}</span>` : ''}</td>
       <td><span class="badge badge-${item.translit_status||'none'}">${item.translit_status||'none'}</span></td>
       <td>${item.is_modified ? `<span class="badge badge-modified">edited</span>` : (item.is_pushed ? `<span class="badge badge-pushed">pushed</span>` : '')}</td>
+      <td>${renderItemCollections(item.collections)}</td>
       <td><button class="btn btn-ghost btn-xs" onclick="event.stopPropagation();openDetail(${item.id})">Edit</button></td>
     </tr>`).join('');
 
@@ -1349,6 +1432,67 @@ function renderItems() {
 }
 
 function thumbUrl(id) { return `https://archive.org/services/img/${id}`; }
+
+function renderItemCollections(cols) {
+  if (!cols) return '<span style="color:var(--text3);font-size:12px;">—</span>';
+  const arr = cols.split('||').filter(Boolean);
+  if (!arr.length) return '<span style="color:var(--text3);font-size:12px;">—</span>';
+  const shown = arr.slice(0,2).map(c=>`<span class="chip">${esc(c)}</span>`).join(' ');
+  const more = arr.length>2 ? ` <span style="color:var(--text3);font-size:11px;">+${arr.length-2}</span>` : '';
+  return `<div style="max-width:180px;display:flex;flex-wrap:wrap;gap:3px;align-items:center;">${shown}${more}</div>`;
+}
+
+function toggleSel(id, checked) {
+  if (checked) S.sel.add(id); else S.sel.delete(id);
+  updateSelBar();
+}
+
+function toggleSelAll(checked) {
+  S.items.forEach(it=>{ if (checked) S.sel.add(it.id); else S.sel.delete(it.id); });
+  [...document.querySelectorAll('.sel-check')].forEach(cb=>cb.checked=checked);
+  updateSelBar();
+}
+
+function updateSelBar() {
+  const bar = document.getElementById('sel-bar');
+  const cnt = document.getElementById('sel-count');
+  const selAll = document.getElementById('sel-all');
+  if (!bar) return;
+  bar.style.display = S.sel.size ? 'flex' : 'none';
+  if (cnt) cnt.textContent = `${S.sel.size} selected`;
+  if (selAll) selAll.checked = !!S.items.length && S.items.every(it=>S.sel.has(it.id));
+}
+
+function clearSel() {
+  S.sel.clear();
+  [...document.querySelectorAll('.sel-check')].forEach(cb=>cb.checked=false);
+  updateSelBar();
+}
+
+async function applySelFields() {
+  if (!S.sel.size) { toast('Nothing selected','error'); return; }
+  const field = document.getElementById('sel-field').value;
+  const value = document.getElementById('sel-value').value.trim();
+  if (!value) { toast('Enter a value for the field','error'); return; }
+  const r = await api(`/api/collections/${S.activeColl.id}/items/bulk-fields`,'POST',
+    {ids:[...S.sel], fields:{[field]: value}});
+  if (!r.ok) { toast(r.error,'error'); return; }
+  toast(`Updated ${r.data.updated_count} item(s) — ${field}`, 'success');
+  document.getElementById('sel-value').value='';
+  loadItems(isModifiedTab());
+}
+
+async function bulkSelCollection(action) {
+  if (!S.sel.size) { toast('Nothing selected','error'); return; }
+  const collection = document.getElementById('sel-coll').value.trim();
+  if (!collection) { toast('Enter an IA collection identifier','error'); return; }
+  const r = await api(`/api/collections/${S.activeColl.id}/bulk-collection`,'POST',
+    {action, collection, selection:{ids:[...S.sel]}});
+  if (!r.ok) { toast(r.error,'error'); return; }
+  toast(`✓ Queued job #${r.data.job_id} — ${action==='add'?'add':'remove'} ${collection} on ${r.data.matched} item(s)`,'info');
+  trackJob(r.data.job_id);
+  refreshJobBadges();
+}
 
 function renderPagination(total, page, perPage) {
   const pages = Math.ceil(total/perPage)||1;
@@ -1383,8 +1527,14 @@ function setSort(field) {
 async function loadLanguages() {
   if (!S.activeColl) return;
   try {
-    const r = await api(`/api/collections/${S.activeColl.id}/languages`);
+    const p = new URLSearchParams();
+    if (S.activeIaColl) p.set('ia_collection', S.activeIaColl);
+    if (isModifiedTab()) p.set('modified_only','true');
+    const q = p.toString();
+    const r = await api(`/api/collections/${S.activeColl.id}/languages${q?'?'+q:''}`);
     S.langData = r.data;
+    buildLangFilter();
+    buildExportLangSelect();
   } catch(e){}
 }
 
@@ -1398,6 +1548,39 @@ function buildLangFilter() {
     sel.appendChild(o);
   });
   sel.value=cur;
+}
+
+async function loadCollFilter() {
+  if (!S.activeColl) return;
+  try {
+    const r = await api(`/api/collections/${S.activeColl.id}/collections`);
+    const sel = document.getElementById('coll-filter');
+    const cur = S.activeIaColl || '';
+    sel.innerHTML = '<option value="">All Collections</option>' +
+      r.data.map(c=>`<option value="${esc(c.name)}">${esc(c.name)} (${c.count.toLocaleString()})</option>`).join('');
+    sel.value = cur;
+  } catch(e){}
+}
+
+async function applyCollFilter() {
+  if (!S.activeColl) return;
+  const v = document.getElementById('coll-filter').value;
+  S.activeIaColl     = v || null;
+  S.activeIaCollName = v || '';
+  if (v) {
+    document.getElementById('coll-title').textContent = v;
+    document.getElementById('sub-context-label').textContent =
+      `Showing: ${v}  (sub-collection of ${S.activeColl.name})`;
+    document.getElementById('sub-context-bar').classList.add('show');
+  } else {
+    document.getElementById('sub-context-bar').classList.remove('show');
+    document.getElementById('coll-title').textContent = S.activeColl.name;
+  }
+  S.page = 1;
+  document.getElementById('lang-filter').value='';
+  loadItems(false);
+  loadLanguages();
+  updateCollMeta();
 }
 
 function buildExportLangSelect() {
@@ -1482,6 +1665,9 @@ async function generateBatch(langCode) {
 // ══════════════════════════════════════════════════════════
 function buildBulkFields() {
   document.getElementById('bulk-match-field').innerHTML =
+    MATCH_FIELDS.map(f=>`<option value="${f}">${f}</option>`).join('');
+  const selField = document.getElementById('sel-field');
+  if (selField) selField.innerHTML =
     BULK_FIELDS.map(f=>`<option value="${f}">${f}</option>`).join('');
 }
 
@@ -1925,9 +2111,8 @@ async function loadHomeStats() {
     // Sub-collections are IA items — use the public thumbnail URL directly
     const imgUrl = `https://archive.org/services/img/${encodeURIComponent(sub.ia_id)}`;
     const cnt    = (sub.local_count || 0).toLocaleString();
-    const sData  = JSON.stringify({id:sub._super.id,name:sub._super.name,identifier:sub._super.identifier}).replace(/\\/g,'\\\\').replace(/'/g,"\\'");
     gridHtml += `
-      <div class="home-sub-card" onclick="selectSubCollection(JSON.parse('${sData}'),'${_esc(sub.ia_id)}','${_esc(sub.name||sub.ia_id)}')">
+      <div class="home-sub-card" onclick="selectSubCollectionById(${sub._super.id}, ${sub.id})">
         <img class="home-sub-card-img"
              src="${imgUrl}"
              onerror="this.outerHTML='<div class=home-sub-card-img-ph style=\'width:100%;height:110px;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:600;color:var(--text3);background:var(--bg3);\'>${_esc(sub.name||sub.ia_id).slice(0,20)}</div>'"
@@ -1961,9 +2146,11 @@ function selectCollectionById(id) {
                (S.collTree||[]).find(c => c.id === id);
   if (!coll) return;
   S.activeColl = coll; S.activeIaColl = null; S.activeIaCollName = '';
+  document.getElementById('coll-title').textContent = coll.name;
   document.getElementById('sub-context-bar').classList.remove('show');
   renderSidebar(); showView('view-items');
   Promise.all([loadItems(), loadLanguages()]);
+  updateCollMeta();
 }
 
 function showModal(title, bodyHTML, onConfirm) {
@@ -2183,7 +2370,7 @@ function buildBcFields() {
   } else if (scope==='ia_collection') {
     html = `<input id="bc-iacoll" class="input" style="width:240px" placeholder="e.g. abhinavasaraswathi">`;
   } else if (scope==='match_field') {
-    html = `<select id="bc-field" class="input" style="width:auto">${BULK_FIELDS.map(f=>`<option value="${f}">${f}</option>`).join('')}</select>
+    html = `<select id="bc-field" class="input" style="width:auto">${MATCH_FIELDS.map(f=>`<option value="${f}">${f}</option>`).join('')}</select>
             <input id="bc-field-val" class="input" style="width:200px" placeholder="matches (case-insensitive)">
             <label style="font-size:12px;color:var(--text2)"><input id="bc-exact" type="checkbox"> exact</label>`;
   } else if (scope==='modified_only') {

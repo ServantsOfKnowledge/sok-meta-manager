@@ -33,3 +33,4 @@ nohup.out
 # Secrets / config
 .ia.ini
 ~/.ia.ini
+.gstack/
