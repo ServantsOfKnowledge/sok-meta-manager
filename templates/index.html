@@ -1093,11 +1093,8 @@ async function selectCollection(coll) {
   S.activeColl = coll;
   S.activeIaColl = null;
   S.activeIaCollName = '';
-  S.page = 1;
-  document.getElementById('search-input').value='';
-  document.getElementById('lang-filter').value='';
-  document.getElementById('tstatus-filter').value='';
   document.getElementById('sub-context-bar').classList.remove('show');
+  resetListFilters();
   renderSidebar();
   showView('view-items');
   setTab(document.querySelector('.tab[data-tab="all"]'), 'all');
@@ -1117,12 +1114,12 @@ function selectSubCollection(superColl, iaId, name) {
   }
   S.activeIaColl     = iaId;
   S.activeIaCollName = name || iaId;
-  S.page = 1;
   document.getElementById('coll-title').textContent = S.activeIaCollName;
   // Show context bar
   document.getElementById('sub-context-label').textContent =
     `Showing: ${S.activeIaCollName}  (sub-collection of ${superColl.name})`;
   document.getElementById('sub-context-bar').classList.add('show');
+  resetListFilters();
   renderSidebar();
   showView('view-items');
   setTab(document.querySelector('.tab[data-tab="all"]'), 'all');
@@ -1147,8 +1144,8 @@ function clearSubCollection() {
   if (S.activeColl) document.getElementById('coll-title').textContent = S.activeColl.name;
   const cf = document.getElementById('coll-filter');
   if (cf) cf.value = '';
+  resetListFilters();
   renderSidebar();
-  S.page = 1;
   loadItems();
   updateCollMeta();
 }
@@ -1377,6 +1374,25 @@ function clearFilters() {
   document.getElementById('lang-filter').value='';
   document.getElementById('tstatus-filter').value='';
   applyFilters();
+}
+
+// Reset all list filters/sorting/selection to defaults when switching collections
+// or sub-collections, so state from one collection never leaks into another.
+function resetListFilters() {
+  S.page = 1;
+  S.sort = 'title';
+  S.sortDir = 'asc';
+  const si = document.getElementById('search-input'); if (si) si.value = '';
+  const lf = document.getElementById('lang-filter');  if (lf) lf.value = '';
+  const tf = document.getElementById('tstatus-filter'); if (tf) tf.value = '';
+  document.querySelectorAll('th').forEach(t=>{
+    t.classList.remove('sorted');
+    const s=t.querySelector('.th-sort'); if(s) s.textContent='↕';
+  });
+  document.querySelectorAll('.sel-check').forEach(cb=>cb.checked=false);
+  S.sel.clear();
+  updateSelBar();
+  updateActiveFiltersBar();
 }
 
 function isModifiedTab() {
@@ -2203,6 +2219,7 @@ function selectCollectionById(id) {
   S.activeColl = coll; S.activeIaColl = null; S.activeIaCollName = '';
   document.getElementById('coll-title').textContent = coll.name;
   document.getElementById('sub-context-bar').classList.remove('show');
+  resetListFilters();
   renderSidebar(); showView('view-items');
   Promise.all([loadItems(), loadLanguages()]);
   updateCollMeta();
