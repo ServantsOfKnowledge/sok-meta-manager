@@ -815,6 +815,21 @@ def api_bulk_collection(coll_id):
     return ok({"job_id": job_id, "matched": matched}), 202
 
 
+@app.route("/api/collections/<int:coll_id>/bulk-count", methods=["POST"])
+def api_bulk_count(coll_id):
+    """Live estimate of how many items a bulk selection matches (no job queued)."""
+    coll = db.get_collection(coll_id)
+    if not coll:
+        return err("Collection not found", 404)
+    body = request.get_json(silent=True) or {}
+    selection = body.get("selection") or {}
+    try:
+        matched = db.count_items(coll_id, selection)
+    except Exception as e:
+        return err(f"Invalid selection: {e}")
+    return ok({"matched": matched})
+
+
 @app.route("/api/collections/<int:coll_id>/fetch-stats", methods=["POST"])
 def api_fetch_stats(coll_id):
     """Queue fetching view/download counts from IA for every item in the

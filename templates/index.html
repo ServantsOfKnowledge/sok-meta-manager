@@ -664,20 +664,12 @@ th.sorted .th-sort{opacity:1;}
       <!-- Bulk: add/remove collection membership -->
       <div class="card">
         <h3>Add / Remove from another collection</h3>
-        <p style="font-size:12px;color:var(--text2);margin-top:2px">Pick items below, then add or remove them all from a target collection in one queued job.</p>
+        <p style="font-size:12px;color:var(--text2);margin-top:2px">Match a set of items in this collection, then add or remove them all from a target IA collection in one queued job.</p>
+        <div style="margin-top:10px" id="bc-info" class="bc-info"></div>
         <div style="margin-top:10px;display:flex;flex-wrap:wrap;gap:8px;align-items:center">
-          <label style="font-size:12px;color:var(--text2)">Action</label>
-          <select id="bc-action" class="input" style="width:auto">
-            <option value="add">Add to</option>
-            <option value="remove">Remove from</option>
-          </select>
-          <label style="font-size:12px;color:var(--text2)">Target collection</label>
-          <input id="bc-collection" class="input" style="width:260px" placeholder="e.g. abhinavasaraswathi">
-        </div>
-        <div style="margin-top:10px;display:flex;flex-wrap:wrap;gap:8px;align-items:center">
-          <label style="font-size:12px;color:var(--text2)">Scope</label>
+          <label style="font-size:12px;color:var(--text3)">Which items (in <span id="bc-current-coll">this collection</span>)</label>
           <select id="bc-scope" class="input" style="width:auto" onchange="buildBcFields()">
-            <option value="match_all">All items in this collection</option>
+            <option value="match_all">All items</option>
             <option value="q">Search query</option>
             <option value="lang">Language</option>
             <option value="tstatus">Transliteration status</option>
@@ -688,7 +680,15 @@ th.sorted .th-sort{opacity:1;}
           </select>
           <span id="bc-fields"></span>
         </div>
-        <div style="margin-top:10px" id="bc-info" class="bc-info"></div>
+        <div style="margin-top:10px;display:flex;flex-wrap:wrap;gap:8px;align-items:center">
+          <label style="font-size:12px;color:var(--text3)">Then</label>
+          <select id="bc-action" class="input" style="width:auto" onchange="refreshBcInfo()">
+            <option value="add">ADD them to</option>
+            <option value="remove">REMOVE them from</option>
+          </select>
+          <label style="font-size:12px;color:var(--text3)">IA collection</label>
+          <input id="bc-collection" class="input" style="width:260px" placeholder="e.g. sochara" oninput="refreshBcInfo()">
+        </div>
         <div style="margin-top:10px">
           <button class="btn gold" onclick="runBulkCollection()">Queue bulk job</button>
           <span id="bc-result" style="margin-left:10px;font-size:12px"></span>
@@ -1371,6 +1371,7 @@ function setTab(el, tab) {
     }
   } else if (tab==='bulk') {
     document.getElementById('sub-bulk').style.display='block';
+    refreshBcInfo();
   } else if (tab==='languages') {
     document.getElementById('sub-languages').style.display='block';
     renderLanguages();
@@ -2472,7 +2473,7 @@ function buildBcFields() {
   if (!el) return;
   let html = '';
   if (scope==='q') {
-    html = `<input id="bc-q" class="input" style="width:220px" placeholder="Search — e.g. magazine">`;
+    html = `<input id="bc-q" class="input" style="width:220px" placeholder="matches title/identifier, e.g. magazine">`;
   } else if (scope==='lang') {
     html = `<input id="bc-lang" class="input" style="width:120px" placeholder="e.g. hin / tel / mar"/>`;
   } else if (scope==='tstatus') {
@@ -2497,7 +2498,74 @@ function buildBcFields() {
     html = `<span style="font-size:12px;color:var(--text2)">Every item stored locally for this collection.</span>`;
   }
   el.innerHTML = html;
+  refreshBcInfo();
 }
+
+let _bcInfoSeq = 0;
+let _bcTimer = null;
+
+function describeBcScope(scope, sel) {
+  switch (scope) {
+    case 'match_all': return '<b>all items</b>';
+    case 'q': return `identifier/title <b>contains</b> "${esc(sel.q)}"`;
+    case 'lang': return `detected language is <b>${esc(sel.lang)}</b>`;
+    case 'tstatus': return `transliteration status is <b>${esc(sel.tstatus)}</b>`;
+    case 'ia_collection': return `currently a member of IA collection <b>${esc(sel.ia_collection)}</b>`;
+    case 'ia_collection_not': return `<b>NOT</b> currently a member of IA collection <b>${esc(sel.ia_collection_not)}</b>`;
+    case 'match_field': return sel.exact
+        ? `field <b>${esc(sel.match_field)}</b> equals <b>${esc(sel.match_pattern)}</b>`
+        : `field <b>${esc(sel.match_field)}</b> contains <b>${esc(sel.match_pattern)}</b>`;
+    case 'modified_only': return 'items with un-pushed local edits';
+    default: return '';
+  }
+}
+
+function bcMissingFields(scope, sel) {
+  if (scope==='q' && !(sel.q||'').trim()) return 'Type a search query to pick which items to match.';
+  if (scope==='lang' && !(sel.lang||'').trim()) return 'Enter a language code to match.';
+  if (scope==='ia_collection' && !(sel.ia_collection||'').trim()) return 'Enter an IA collection identifier.';
+  if (scope==='ia_collection_not' && !(sel.ia_collection_not||'').trim()) return 'Enter an IA collection identifier.';
+  if (scope==='match_field' && !(sel.match_pattern||'').trim()) return 'Enter a value for the field to match.';
+  return '';
+}
+
+async function refreshBcInfo() {
+  if (!S.activeColl) return;
+  const el = document.getElementById('bc-info');
+  if (!el) return;
+  const collSpan = document.getElementById('bc-current-coll');
+  if (collSpan) collSpan.textContent = S.activeColl.name;
+  const scope = document.getElementById('bc-scope').value;
+  const action = document.getElementById('bc-action').value;
+  const collection = document.getElementById('bc-collection').value.trim();
+  const sel = bcSelection();
+  const missing = bcMissingFields(scope, sel);
+  if (missing) { el.innerHTML = `<span style="font-size:12px;color:var(--text3);font-style:italic">${missing}</span>`; return; }
+  el.innerHTML = `<div style="font-size:13px;line-height:1.6;background:var(--bg2);border:1px solid var(--border);border-radius:8px;padding:10px 12px;">
+      <div>In <b>${esc(S.activeColl.name)}</b>, match ${describeBcScope(scope, sel)}.</div>
+      <div>Then <b style="color:var(--gold);text-transform:uppercase">${action==='add'?'Add':'Remove'}</b> them ${action==='add'?'to':'from'} the IA collection <span class="filter-chip">${esc(collection)}</span>.</div>
+      <div id="bc-est" style="color:var(--text3);font-size:12px;margin-top:2px">Counting matches…</div>
+    </div>`;
+  const seq = ++_bcInfoSeq;
+  clearTimeout(_bcTimer);
+  _bcTimer = setTimeout(async ()=>{
+    try {
+      const r = await api(`/api/collections/${S.activeColl.id}/bulk-count`,'POST',{selection: sel});
+      if (seq !== _bcInfoSeq) return;
+      const est = document.getElementById('bc-est');
+      if (est) est.innerHTML = r.ok
+        ? `<b style="color:var(--green)">${r.data.matched.toLocaleString()}</b> item(s) will be affected.`
+        : `<span style="color:var(--red)">Error: ${esc(r.error)}</span>`;
+    } catch(e) {
+      if (seq === _bcInfoSeq) { const est = document.getElementById('bc-est'); if (est) est.textContent = 'Count failed.'; }
+    }
+  }, 400);
+}
+
+document.getElementById('bc-fields')?.addEventListener('input', ()=>{
+  clearTimeout(_bcTimer);
+  _bcTimer = setTimeout(refreshBcInfo, 350);
+});
 
 function bcSelection() {
   const scope = document.getElementById('bc-scope').value;
@@ -2523,13 +2591,8 @@ async function runBulkCollection() {
   if (!collection) { toast('Enter a target collection identifier','error'); return; }
 const sel = bcSelection();
     const scope = document.getElementById('bc-scope').value;
-    if ((scope==='q' && !(sel.q||'').trim()) ||
-        (scope==='lang' && !(sel.lang||'').trim()) ||
-        (scope==='ia_collection' && !(sel.ia_collection||'').trim()) ||
-        (scope==='ia_collection_not' && !(sel.ia_collection_not||'').trim()) ||
-        (scope==='match_field' && !(sel.match_pattern||'').trim())) {
-      toast('Complete the selection fields','error'); return;
-    }
+    const missing = bcMissingFields(scope, sel);
+    if (missing) { toast(missing,'error'); return; }
   const btn = event?.currentTarget;
   const r = await api(`/api/collections/${S.activeColl.id}/bulk-collection`,'POST',{action, collection, selection: sel});
   if (!r.ok) { showBcResult('Error: '+r.error,'err'); toast(r.error,'error'); return; }
