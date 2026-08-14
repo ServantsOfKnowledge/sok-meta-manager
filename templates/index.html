@@ -1788,6 +1788,7 @@ async function loadPush() {
       </div>
       <span class="push-status ${item.is_pushed?'pushed':'pending'}" id="ps-${item.id}">${item.is_pushed?'Pushed':'Pending'}</span>
       <button class="btn btn-primary btn-sm" onclick="pushItem(${item.id})" id="pb-${item.id}" ${item.is_pushed?'disabled':''}>Push</button>
+      ${!item.is_pushed ? `<button class="btn btn-ghost btn-sm" onclick="cancelPushItem(${item.id})" title="Cancel this push and revert all local changes to the last IA-synced values">Cancel</button>` : ''}
     </div>`).join('');
 }
 
@@ -1802,6 +1803,14 @@ async function pushItem(id) {
     s.textContent='Error'; s.className='push-status error';
     toast('Push failed: '+(r.data?.error||'unknown'),'error');
   }
+}
+
+async function cancelPushItem(id) {
+  if (!confirm('Cancel this push and revert ALL local changes for this item back to the last IA-synced values? This cannot be undone easily.')) return;
+  const r = await api(`/api/items/${id}/revert`,'POST');
+  if (!r.ok) { toast(r.error,'error'); return; }
+  toast('Cancelled — local changes reverted to IA values','success');
+  loadPush();
 }
 
 async function pushAll() {
