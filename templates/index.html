@@ -74,6 +74,12 @@ html,body{height:100%;font-family:'Segoe UI',system-ui,sans-serif;background:var
 .sub-item .si-count{font-size:11px;color:var(--text3);flex-shrink:0;}
 .tree-sync-badge{font-size:10px;color:var(--text3);padding:1px 5px;background:var(--bg4);border-radius:8px;flex-shrink:0;}
 .tree-sync-badge.running{color:var(--amber);background:#fff8e6;}
+.sync-menu-wrap{position:relative;}
+.sync-menu{display:none;position:absolute;z-index:50;right:0;top:100%;margin-top:4px;background:var(--bg2);border:1px solid var(--border);border-radius:6px;box-shadow:0 4px 14px rgba(0,0,0,.15);min-width:190px;padding:4px;}
+.sync-menu.open{display:block;}
+.sync-menu-item{display:flex;align-items:center;gap:6px;font-size:12px;padding:6px 10px;border-radius:4px;cursor:pointer;color:var(--text);white-space:nowrap;}
+.sync-menu-item:hover{background:var(--bg4);}
+.sync-menu-item .sm-desc{font-size:10px;color:var(--text3);margin-left:auto;}
 .noindex-opt{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--text2);padding:4px 0;}
 .sub-context-bar{padding:5px 24px;background:#fdf5e0;border-bottom:1px solid #e8d595;font-size:12px;color:var(--gold-dim);display:none;align-items:center;gap:8px;}
 .sub-context-bar.show{display:flex;}
@@ -1002,8 +1008,14 @@ function renderSidebar() {
         <div class="super-coll-actions" onclick="event.stopPropagation()">
           ${syncing
             ? `<span class="tree-sync-badge running">${syncState.status==='queued'?'queued…':'syncing…'}</span>`
-            : `<span class="sc-btn" onclick="quickSync(${c.id})" title="Smart sync">⚡</span>
-               <span class="sc-btn" onclick="discoverSubs(${c.id})" title="Refresh sub-collections">📂</span>
+            : `<span class="sc-btn sync-menu-wrap" onclick="toggleSyncMenu(${c.id})" title="Refresh / sync this collection">⟳
+                 <div class="sync-menu" id="syncmenu-${c.id}" onclick="event.stopPropagation()">
+                   <div class="sync-menu-item" onclick="treeSync(${c.id},'smart')">⚡ Smart sync<span class="sm-desc">changed since last sync</span></div>
+                   <div class="sync-menu-item" onclick="treeSync(${c.id},'full')">⟳ Full sync<span class="sm-desc">public items</span></div>
+                   <div class="sync-menu-item" onclick="treeSync(${c.id},'full-hidden')">🔒 Full sync<span class="sm-desc">incl. hidden items</span></div>
+                   <div class="sync-menu-item" onclick="treeSync(${c.id},'discover')">📂 Refresh sub-collections<span class="sm-desc"></span></div>
+                 </div>
+               </span>
                <span class="sc-btn" onclick="deleteCollection(${c.id})" title="Remove collection">×</span>`
           }
         </div>
@@ -1033,6 +1045,37 @@ async function quickSync(collId) {
   S.activeIaColl = null;
   renderSidebar();
   await syncSmart();
+}
+
+function toggleSyncMenu(collId) {
+  const others = document.querySelectorAll('.sync-menu.open');
+  others.forEach(m=>{ if (m.id !== 'syncmenu-'+collId) m.classList.remove('open'); });
+  const menu = document.getElementById('syncmenu-'+collId);
+  if (menu) menu.classList.toggle('open');
+}
+
+document.addEventListener('click', (e) => {
+  if (!e.target.closest('.sync-menu-wrap')) {
+    document.querySelectorAll('.sync-menu.open').forEach(m=>m.classList.remove('open'));
+  }
+});
+
+async function treeSync(collId, kind) {
+  document.querySelectorAll('.sync-menu.open').forEach(m=>m.classList.remove('open'));
+  const coll = S.collTree.find(c=>c.id===collId);
+  if (!coll) return;
+  if (kind === 'discover') {
+    await discoverSubs(collId);
+    return;
+  }
+  if (S.activeColl?.id !== collId || S.activeIaColl) {
+    S.activeColl = coll;
+    S.activeIaColl = null;
+    renderSidebar();
+  }
+  if (kind === 'full') await syncFull(false);
+  else if (kind === 'full-hidden') await syncFull(true);
+  else await syncSmart();
 }
 
 function toggleSuper(event, collId) {
