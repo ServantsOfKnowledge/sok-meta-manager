@@ -723,6 +723,9 @@ def _build_selection_sql(selection):
         if selection.get("ia_collection"):
             where.append("i.id IN (SELECT item_id FROM item_collections WHERE collection=?)")
             params.append(selection["ia_collection"])
+        if selection.get("ia_collection_not"):
+            where.append("i.id NOT IN (SELECT item_id FROM item_collections WHERE collection=?)")
+            params.append(selection["ia_collection_not"])
         if selection.get("modified_only"):
             where.append("i.is_modified = 1")
         if selection.get("lang"):
@@ -787,7 +790,7 @@ def set_item_membership(collection_id, item_id, coll_name, present):
 
 def list_items(collection_id, search=None, modified_only=False,
                lang_code=None, translit_status=None,
-               ia_collection=None,
+               ia_collection=None, ia_collection_not=None,
                page=1, per_page=50, sort="title", sort_dir="asc"):
     conn = get_coll_db(collection_id)
     where, params = [], []
@@ -795,6 +798,9 @@ def list_items(collection_id, search=None, modified_only=False,
     if ia_collection:
         where.append("i.id IN (SELECT item_id FROM item_collections WHERE collection=?)")
         params.append(ia_collection)
+    if ia_collection_not:
+        where.append("i.id NOT IN (SELECT item_id FROM item_collections WHERE collection=?)")
+        params.append(ia_collection_not)
     if modified_only:
         where.append("i.is_modified=1")
     if lang_code:

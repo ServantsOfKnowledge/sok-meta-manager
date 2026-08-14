@@ -669,6 +669,7 @@ def api_list_items(coll_id):
         lang_code       = request.args.get("lang") or None,
         translit_status = request.args.get("tstatus") or None,
         ia_collection   = request.args.get("ia_collection") or None,
+        ia_collection_not = request.args.get("ia_collection_not") or None,
         page            = int(request.args.get("page", 1)),
         per_page        = int(request.args.get("per_page", 50)),
         sort            = request.args.get("sort", "title"),

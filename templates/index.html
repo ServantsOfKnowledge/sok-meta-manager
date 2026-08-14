@@ -552,6 +552,7 @@ th.sorted .th-sort{opacity:1;}
       <select class="f-select" id="coll-filter" onchange="applyCollFilter()">
         <option value="">All Collections</option>
       </select>
+      <input type="text" id="not-col-filter" placeholder="Not in collection…" style="width:132px" oninput="debounceSearch()" title="Show only items that are NOT members of this IA collection (e.g. sochara)"/>
       <select class="f-select" id="tstatus-filter" onchange="applyFilters()">
         <option value="">All Translit Status</option>
         <option value="none">None</option>
@@ -681,6 +682,7 @@ th.sorted .th-sort{opacity:1;}
             <option value="lang">Language</option>
             <option value="tstatus">Transliteration status</option>
             <option value="ia_collection">Member of (IA collection)</option>
+            <option value="ia_collection_not">NOT member of (IA collection)</option>
             <option value="match_field">Field / pattern</option>
             <option value="modified_only">Only items with local edits</option>
           </select>
@@ -1387,7 +1389,7 @@ function setTab(el, tab) {
 let _searchTimer = null;
 function debounceSearch() {
   clearTimeout(_searchTimer);
-  _searchTimer = setTimeout(()=>{ S.page=1; loadItems(isModifiedTab()); }, 280);
+  _searchTimer = setTimeout(()=>{ S.page=1; loadItems(isModifiedTab()); updateActiveFiltersBar(); }, 280);
 }
 
 function applyFilters() { S.page=1; loadItems(isModifiedTab()); updateActiveFiltersBar(); }
@@ -1395,6 +1397,7 @@ function clearFilters() {
   document.getElementById('search-input').value='';
   document.getElementById('lang-filter').value='';
   document.getElementById('tstatus-filter').value='';
+  document.getElementById('not-col-filter').value='';
   applyFilters();
 }
 
@@ -1407,6 +1410,7 @@ function resetListFilters() {
   const si = document.getElementById('search-input'); if (si) si.value = '';
   const lf = document.getElementById('lang-filter');  if (lf) lf.value = '';
   const tf = document.getElementById('tstatus-filter'); if (tf) tf.value = '';
+  const nf = document.getElementById('not-col-filter'); if (nf) nf.value = '';
   document.querySelectorAll('th').forEach(t=>{
     t.classList.remove('sorted');
     const s=t.querySelector('.th-sort'); if(s) s.textContent='↕';
@@ -1425,10 +1429,12 @@ function updateActiveFiltersBar() {
   const q  = document.getElementById('search-input').value;
   const ln = document.getElementById('lang-filter');
   const ts = document.getElementById('tstatus-filter');
+  const nf = document.getElementById('not-col-filter');
   const chips = [];
   if (q)         chips.push(`Search: "${q}"`);
   if (ln.value)  chips.push(`Language: ${ln.options[ln.selectedIndex]?.text}`);
   if (ts.value)  chips.push(`Translit: ${ts.value}`);
+  if (nf.value)  chips.push(`Not in: ${nf.value}`);
   const bar = document.getElementById('active-filters');
   if (chips.length) {
     bar.classList.remove('hidden');
@@ -1456,6 +1462,8 @@ async function loadItems(modifiedOnly=false) {
     sort: S.sort, sort_dir: S.sortDir,
   };
   if (S.activeIaColl) paramObj.ia_collection = S.activeIaColl;
+  const notColl = document.getElementById('not-col-filter').value.trim();
+  if (notColl) paramObj.ia_collection_not = notColl;
   const params = new URLSearchParams(paramObj);
   const r = await api(`/api/collections/${S.activeColl.id}/items?${params}`);
   S.items = r.data.items;
@@ -2477,6 +2485,8 @@ function buildBcFields() {
     </select>`;
   } else if (scope==='ia_collection') {
     html = `<input id="bc-iacoll" class="input" style="width:240px" placeholder="e.g. abhinavasaraswathi">`;
+  } else if (scope==='ia_collection_not') {
+    html = `<input id="bc-iacoll" class="input" style="width:240px" placeholder="e.g. sochara — items NOT in this">`;
   } else if (scope==='match_field') {
     html = `<select id="bc-field" class="input" style="width:auto">${MATCH_FIELDS.map(f=>`<option value="${f}">${f}</option>`).join('')}</select>
             <input id="bc-field-val" class="input" style="width:200px" placeholder="matches (case-insensitive)">
@@ -2497,6 +2507,7 @@ function bcSelection() {
   else if (scope==='lang')        sel.lang = document.getElementById('bc-lang').value.trim();
   else if (scope==='tstatus')     sel.tstatus = document.getElementById('bc-tstatus').value;
   else if (scope==='ia_collection') sel.ia_collection = document.getElementById('bc-iacoll').value.trim();
+  else if (scope==='ia_collection_not') sel.ia_collection_not = document.getElementById('bc-iacoll').value.trim();
   else if (scope==='match_field') {
     sel.match_field = document.getElementById('bc-field').value;
     sel.match_pattern = document.getElementById('bc-field-val').value.trim();
@@ -2515,6 +2526,7 @@ const sel = bcSelection();
     if ((scope==='q' && !(sel.q||'').trim()) ||
         (scope==='lang' && !(sel.lang||'').trim()) ||
         (scope==='ia_collection' && !(sel.ia_collection||'').trim()) ||
+        (scope==='ia_collection_not' && !(sel.ia_collection_not||'').trim()) ||
         (scope==='match_field' && !(sel.match_pattern||'').trim())) {
       toast('Complete the selection fields','error'); return;
     }
