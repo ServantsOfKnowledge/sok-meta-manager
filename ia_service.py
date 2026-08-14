@@ -39,7 +39,7 @@ SEARCH_FIELDS = [
     "identifier", "title", "creator", "author", "publisher",
     "date", "year", "language", "subject", "description",
     "licenseurl", "mediatype", "volume", "isbn", "source",
-    "collection", "updatedate", "publicdate",
+    "collection", "updatedate", "publicdate", "downloads",
 ]
 
 def fetch_collection_items(
@@ -359,6 +359,54 @@ def remove_from_collection(identifier: str, collection: str) -> dict:
                 "output": result.stdout.strip(), "error": result.stderr.strip()}
     except Exception as e:
         return {"success": False, "output": "", "error": str(e)}
+
+
+# ── Item statistics (views / downloads) ───────────────────────────────────────
+
+VIEWS_API_URL = "https://be-api.us.archive.org/views/v1/short/"
+
+
+def fetch_item_stats(identifiers) -> dict:
+    """Fetch view/download stats for identifiers via the IA Views API.
+
+    Accepts a list of identifiers (batch endpoint allows ~100 per request) and
+    returns ``{identifier: {"all_time", "last_30day", "last_7day", "have_data"}}``.
+    Raises RuntimeError on transport/API failure.
+    """
+    import requests
+    if not identifiers:
+        return {}
+    results: dict = {}
+    batch_size = 20   # keep URLs short; the Views API 502s on long request paths
+    for i in range(0, len(identifiers), batch_size):
+        chunk = identifiers[i:i + batch_size]
+        url = VIEWS_API_URL + ",".join(chunk)
+        data = None
+        last_err = None
+        for attempt in range(3):
+            try:
+                resp = requests.get(url, timeout=60)
+                if resp.status_code >= 500 and resp.status_code < 600:
+                    last_err = RuntimeError(f"HTTP {resp.status_code}")
+                else:
+                    resp.raise_for_status()
+                    data = resp.json()
+                    break
+            except Exception as e:
+                last_err = e
+            time.sleep(1.5 * (attempt + 1))
+        if data is None:
+            raise RuntimeError(f"Views API error (batch from {chunk[0]}): {last_err}")
+        for ident, stats in data.items():
+            if not isinstance(stats, dict):
+                continue
+            results[ident] = {
+                "all_time":   stats.get("all_time", 0) or 0,
+                "last_30day": stats.get("last_30day", 0) or 0,
+                "last_7day":  stats.get("last_7day", 0) or 0,
+                "have_data":  bool(stats.get("have_data")),
+            }
+    return results
 
 
 def check_ia_cli() -> dict:

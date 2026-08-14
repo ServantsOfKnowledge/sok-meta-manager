@@ -89,6 +89,8 @@ def _dispatch_job(job):
         _run_push_all(job_id, coll_id, params)
     elif jt == "bulk-collection":
         _run_bulk_collection(job_id, coll_id, params)
+    elif jt == "fetch-stats":
+        _run_fetch_stats(job_id, coll_id, params)
     elif jt == "copy-alt":
         _run_copy_alt(job_id, coll_id, params)
     elif jt == "translit-generate":
@@ -312,6 +314,59 @@ def _run_bulk_collection(job_id, coll_id, params):
     db.finish_job(job_id, "done", new_count=ok_count)
     db.add_job_log(job_id, "info",
                    f"{action.title()} finished: {ok_count} ok, {failed} failed, {skipped} skipped")
+
+
+def _run_fetch_stats(job_id, coll_id, params):
+    coll = db.get_collection(coll_id)
+    if not coll:
+        db.fail_job(job_id, "Collection no longer exists")
+        return
+    job = db.get_job(job_id) or {}
+    jparams = job.get("params") or {}
+    if isinstance(jparams, str):
+        try:
+            jparams = json.loads(jparams)
+        except Exception:
+            jparams = {}
+
+    total = jparams.get("total")
+    if total is None:
+        total = db.get_stats(coll_id).get("total") or 0
+        db.set_job_resume(job_id, "total", total)
+
+    after_id = jparams.get("last_id")
+    done = int(jparams.get("done") or 0)
+    db.update_job_progress(job_id, done, total)
+    db.add_job_log(job_id, "info",
+                   f"Fetching views/downloads for {total} item(s)"
+                   + (", resuming from item " + str(after_id) if after_id else ""))
+
+    while True:
+        if db.job_cancel_requested(job_id):
+            db.finish_job(job_id, "cancelled")
+            return
+        batch = db.get_item_identifiers(coll_id, after_id=after_id, limit=100)
+        if not batch:
+            break
+        try:
+            stats_map = ia_svc.fetch_item_stats([it["identifier"] for it in batch])
+        except Exception as e:
+            db.fail_job(job_id, str(e))
+            return
+        # Only persist rows IA actually has data for, so a transient miss
+        # never zeroes out previously captured counts.
+        stats_map = {k: v for k, v in stats_map.items() if v.get("have_data")}
+        if stats_map:
+            db.update_item_stats_batch(coll_id, stats_map)
+        after_id = batch[-1]["id"]
+        done += len(batch)
+        db.set_job_resume(job_id, "last_id", after_id)
+        db.set_job_resume(job_id, "done", done)
+        db.update_job_progress(job_id, done, total)
+        time.sleep(0.05)
+
+    db.finish_job(job_id, "done", new_count=done)
+    db.add_job_log(job_id, "info", f"Updated views/downloads for {done} item(s)")
 
 
 def _run_copy_alt(job_id, coll_id, params):
@@ -757,6 +812,18 @@ def api_bulk_collection(coll_id):
     db.add_job_log(job_id, "info",
                    f"{matched} item(s) matched; queued {action} to '{target}'")
     return ok({"job_id": job_id, "matched": matched}), 202
+
+
+@app.route("/api/collections/<int:coll_id>/fetch-stats", methods=["POST"])
+def api_fetch_stats(coll_id):
+    """Queue fetching view/download counts from IA for every item in the
+    collection's local database."""
+    coll = db.get_collection(coll_id)
+    if not coll:
+        return err("Collection not found", 404)
+    job_id = db.create_job("fetch-stats", coll_id, {},
+                           title=f"Fetch views/downloads · {coll['name']}")
+    return ok({"job_id": job_id}), 202
 
 
 @app.route("/api/collections/<int:coll_id>/items/bulk-fields", methods=["POST"])

@@ -220,6 +220,9 @@ def _init_coll_conn(conn, identifier):
             ("ia_updatedate",     "TEXT"),
             ("detected_language", "TEXT"),
             ("translit_status",   "TEXT DEFAULT 'none'"),
+            ("downloads",         "INTEGER DEFAULT 0"),
+            ("views_30d",         "INTEGER DEFAULT 0"),
+            ("views_7d",          "INTEGER DEFAULT 0"),
         ]:
             _safe_add_column(c, "items", col, typedef)
         if fts_supported():
@@ -644,6 +647,7 @@ def upsert_item(collection_id, identifier, metadata_dict, ia_raw=None):
         ).fetchone()
 
         core = {f: metadata_dict.get(f) for f in CORE_FIELDS}
+        core["downloads"] = metadata_dict.get("downloads") or 0
         extra = {k: v for k, v in metadata_dict.items()
                  if k not in CORE_FIELDS and k not in ('identifier', '_collections')}
         core["extra_metadata"] = json.dumps(extra) if extra else None
@@ -1008,6 +1012,42 @@ def mark_pushed(item_id):
         )
         conn.commit()
         _dirty_coll(coll_id)
+    finally:
+        conn.close()
+
+
+def get_item_identifiers(collection_id, after_id=None, limit=100):
+    """Return item id/identifier rows for a collection, ordered by id.
+    Pass ``after_id`` to page through large collections (resumable stats sync)."""
+    conn = get_coll_db(collection_id)
+    try:
+        if after_id:
+            rows = conn.execute(
+                "SELECT id, identifier FROM items WHERE id>? ORDER BY id LIMIT ?",
+                (after_id, limit),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT id, identifier FROM items ORDER BY id LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def update_item_stats_batch(collection_id, stats_map):
+    """Write IA view/download stats keyed by identifier in one connection."""
+    conn = get_coll_db(collection_id)
+    try:
+        conn.executemany(
+            "UPDATE items SET downloads=?, views_30d=?, views_7d=? WHERE identifier=?",
+            [(s.get("all_time") or 0, s.get("last_30day") or 0,
+              s.get("last_7day") or 0, ident)
+             for ident, s in stats_map.items()],
+        )
+        conn.commit()
+        _dirty_coll(collection_id)
     finally:
         conn.close()
 

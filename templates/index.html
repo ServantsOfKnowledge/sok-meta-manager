@@ -604,6 +604,7 @@ th.sorted .th-sort{opacity:1;}
               <th style="width:78px">Language</th>
               <th style="width:88px">Translit</th>
               <th style="width:56px">Status</th>
+              <th style="width:74px" title="Downloads (all-time) · views last 30d / 7d">Stats</th>
               <th>Collections</th>
               <th style="width:38px"></th>
             </tr>
@@ -769,6 +770,14 @@ th.sorted .th-sort{opacity:1;}
 
     <!-- Metadata tab -->
     <div id="ptab-meta">
+      <div class="panel-section">
+        <div class="section-title">📊 IA Stats</div>
+        <div style="display:flex;gap:18px;flex-wrap:wrap;font-size:13px;margin-bottom:14px;">
+          <div><span style="color:var(--text2);font-size:12px;">Downloads (all-time)</span><div id="panel-stats-dl" style="font-weight:700;font-size:16px;">–</div></div>
+          <div><span style="color:var(--text2);font-size:12px;">Views · 30d</span><div id="panel-stats-30d" style="font-weight:700;font-size:16px;">–</div></div>
+          <div><span style="color:var(--text2);font-size:12px;">Views · 7d</span><div id="panel-stats-7d" style="font-weight:700;font-size:16px;">–</div></div>
+        </div>
+      </div>
       <div class="panel-section">
         <div class="section-title">Main Fields</div>
         <div class="field-pair">
@@ -1013,6 +1022,7 @@ function renderSidebar() {
                    <div class="sync-menu-item" onclick="treeSync(${c.id},'smart')">⚡ Smart sync<span class="sm-desc">changed since last sync</span></div>
                    <div class="sync-menu-item" onclick="treeSync(${c.id},'full')">⟳ Full sync<span class="sm-desc">public items</span></div>
                    <div class="sync-menu-item" onclick="treeSync(${c.id},'full-hidden')">🔒 Full sync<span class="sm-desc">incl. hidden items</span></div>
+                   <div class="sync-menu-item" onclick="treeSync(${c.id},'stats')">📊 Fetch views/downloads<span class="sm-desc">from IA</span></div>
                    <div class="sync-menu-item" onclick="treeSync(${c.id},'discover')">📂 Refresh sub-collections<span class="sm-desc"></span></div>
                  </div>
                </span>
@@ -1075,7 +1085,19 @@ async function treeSync(collId, kind) {
   }
   if (kind === 'full') await syncFull(false);
   else if (kind === 'full-hidden') await syncFull(true);
+  else if (kind === 'stats') await fetchStats(collId);
   else await syncSmart();
+}
+
+async function fetchStats(collId) {
+  const r = await api(`/api/collections/${collId}/fetch-stats`,'POST');
+  if (!r.ok) { toast(r.error,'error'); return; }
+  toast(`📊 Fetch views/downloads queued (job #${r.data.job_id})`,'info');
+  trackJob(r.data.job_id);
+  refreshJobBadges();
+  await waitJobDone(r.data.job_id, 180000);
+  loadItems(isModifiedTab());
+  toast('Views/downloads updated','success');
 }
 
 function toggleSuper(event, collId) {
@@ -1478,6 +1500,10 @@ function renderItems() {
       <td>${item.detected_language ? `<span class="chip ${INDIAN_CODES.has(item.detected_language)?'indian':''}">${esc(item.detected_language)}</span>` : ''}</td>
       <td><span class="badge badge-${item.translit_status||'none'}">${item.translit_status||'none'}</span></td>
       <td>${item.is_modified ? `<span class="badge badge-modified">edited</span>` : (item.is_pushed ? `<span class="badge badge-pushed">pushed</span>` : '')}</td>
+      <td>
+        <div style="font-size:12px;font-weight:600;color:var(--text);">${item.downloads||0}</div>
+        <div style="font-size:10px;color:var(--text3);" title="views · last 30d / 7d">${item.views_30d||0} / ${item.views_7d||0}</div>
+      </td>
       <td>${renderItemCollections(item.collections)}</td>
       <td><button class="btn btn-ghost btn-xs" onclick="event.stopPropagation();openDetail(${item.id})">Edit</button></td>
     </tr>`).join('');
@@ -1872,6 +1898,10 @@ function fillPanel(item) {
   img.src=thumbUrl(item.identifier);
 
   META_FIELDS.forEach(f=>{ const el=document.getElementById('pf-'+f); if(el) el.value=item[f]||''; });
+  const sdl=document.getElementById('panel-stats-dl'), s30=document.getElementById('panel-stats-30d'), s7=document.getElementById('panel-stats-7d');
+  if (sdl) sdl.textContent=(item.downloads??0).toLocaleString();
+  if (s30) s30.textContent=(item.views_30d??0).toLocaleString();
+  if (s7)  s7.textContent=(item.views_7d??0).toLocaleString();
   fillTranslitTab(item);
   fillCollsTab(item);
 }
@@ -2570,7 +2600,7 @@ function parseParams(p) {
 }
 
 function jobIcon(jt) {
-  return { 'full-sync':'⟳','smart-sync':'⚡','discover-subs':'📂','push-all':'⤴︎','bulk-collection':'⚙︎',
+  return { 'full-sync':'⟳','smart-sync':'⚡','discover-subs':'📂','push-all':'⤴︎','bulk-collection':'⚙︎','fetch-stats':'📊',
            'copy-alt':'⇄','translit-generate':'✍︎','rebuild-index':'🔎','vacuum':'🧹' }[jt] || '•';
 }
 
