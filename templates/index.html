@@ -1958,8 +1958,7 @@ async function resetTranslit() {
 // ══════════════════════════════════════════════════════════
 function fillCollsTab(item) {
   const list=document.getElementById('panel-colls-list');
-  const colls=(item._collections||'').split?.(item._collections,'||') || item._collections || [];
-  const arr = Array.isArray(colls) ? colls : (item.collections||'').split('||').filter(Boolean);
+  const arr=(item.collections||'').split('||').filter(Boolean);
   if (!arr.length) { list.innerHTML='<div style="color:var(--text3);font-size:13px;">No collections on IA.</div>'; return; }
   list.innerHTML=arr.map(c=>`
     <div style="display:flex;align-items:center;gap:8px;padding:6px 0;border-bottom:1px solid var(--border);">
