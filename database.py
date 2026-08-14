@@ -721,10 +721,10 @@ def _build_selection_sql(selection):
             s = f"%{q}%"
             params.extend([s] * 6)
         if selection.get("ia_collection"):
-            where.append("i.id IN (SELECT item_id FROM item_collections WHERE collection=?)")
+            where.append("i.id IN (SELECT item_id FROM item_collections WHERE collection = ? COLLATE NOCASE)")
             params.append(selection["ia_collection"])
         if selection.get("ia_collection_not"):
-            where.append("i.id NOT IN (SELECT item_id FROM item_collections WHERE collection=?)")
+            where.append("i.id NOT IN (SELECT item_id FROM item_collections WHERE collection = ? COLLATE NOCASE)")
             params.append(selection["ia_collection_not"])
         if selection.get("modified_only"):
             where.append("i.is_modified = 1")
@@ -796,10 +796,10 @@ def list_items(collection_id, search=None, modified_only=False,
     where, params = [], []
 
     if ia_collection:
-        where.append("i.id IN (SELECT item_id FROM item_collections WHERE collection=?)")
+        where.append("i.id IN (SELECT item_id FROM item_collections WHERE collection = ? COLLATE NOCASE)")
         params.append(ia_collection)
     if ia_collection_not:
-        where.append("i.id NOT IN (SELECT item_id FROM item_collections WHERE collection=?)")
+        where.append("i.id NOT IN (SELECT item_id FROM item_collections WHERE collection = ? COLLATE NOCASE)")
         params.append(ia_collection_not)
     if modified_only:
         where.append("i.is_modified=1")
