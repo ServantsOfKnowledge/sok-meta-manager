@@ -110,8 +110,8 @@ html,body{height:100%;font-family:'Segoe UI',system-ui,sans-serif;background:var
 /* Super-collection stat banner */
 .home-super-card{display:flex;align-items:center;gap:18px;background:var(--gold-bg);border:1px solid #e8d595;border-radius:10px;padding:18px 22px;margin-bottom:10px;cursor:pointer;transition:var(--tr);}
 .home-super-card:hover{border-color:var(--gold);box-shadow:0 2px 14px rgba(184,134,10,.14);}
-.home-super-thumb{width:72px;height:72px;border-radius:8px;object-fit:cover;flex-shrink:0;background:var(--bg4);border:1px solid var(--border);}
-.home-super-thumb-ph{width:72px;height:72px;border-radius:8px;flex-shrink:0;background:linear-gradient(135deg,var(--gold-dim),var(--gold));display:flex;align-items:center;justify-content:center;font-size:18px;font-weight:700;color:#fff;letter-spacing:.04em;text-align:center;line-height:1.2;}
+.home-super-thumb{height:64px;width:auto;max-width:160px;border-radius:6px;object-fit:contain;flex-shrink:0;background:#fff;border:1px solid var(--border);padding:4px;}
+.home-super-thumb-ph{width:60px;height:60px;border-radius:8px;flex-shrink:0;background:linear-gradient(135deg,var(--gold-dim),var(--gold));display:flex;align-items:center;justify-content:center;font-size:16px;font-weight:700;color:#fff;letter-spacing:.04em;text-align:center;line-height:1.2;}
 .home-super-info{flex:1;min-width:0;}
 .home-super-name{font-size:18px;font-weight:700;color:var(--gold);margin-bottom:4px;}
 .home-super-meta{font-size:12px;color:var(--text2);display:flex;gap:12px;flex-wrap:wrap;}
@@ -130,7 +130,7 @@ html,body{height:100%;font-family:'Segoe UI',system-ui,sans-serif;background:var
 .home-sub-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(170px,1fr));gap:14px;}
 .home-sub-card{background:var(--bg);border:1px solid var(--border);border-radius:8px;overflow:hidden;cursor:pointer;transition:var(--tr);}
 .home-sub-card:hover{border-color:var(--gold);box-shadow:0 2px 10px rgba(184,134,10,.13);transform:translateY(-2px);}
-.home-sub-card-img{width:100%;height:110px;object-fit:cover;background:var(--bg3);display:block;}
+.home-sub-card-img{width:100%;height:110px;object-fit:contain;background:var(--bg3);display:block;padding:8px;}
 .home-sub-card-img-ph{width:100%;height:110px;background:linear-gradient(135deg,var(--bg3),var(--bg4));display:flex;align-items:center;justify-content:center;font-size:32px;color:var(--text3);}
 .home-sub-card-body{padding:10px 12px 12px;}
 .home-sub-card-name{font-size:12px;font-weight:600;color:var(--text);margin-bottom:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
@@ -592,6 +592,7 @@ th.sorted .th-sort{opacity:1;}
               <th style="width:30px"><input type="checkbox" id="sel-all" onchange="toggleSelAll(this.checked)" title="Select all on this page"></th>
               <th style="width:50px">Thumb</th>
               <th class="sortable" onclick="setSort('title')" id="th-title">Title <span class="th-sort">↕</span></th>
+              <th class="sortable" onclick="setSort('identifier')" id="th-identifier">Identifier <span class="th-sort">↕</span></th>
               <th class="sortable" onclick="setSort('creator')" id="th-creator">Creator <span class="th-sort">↕</span></th>
               <th class="sortable" onclick="setSort('year')" id="th-year" style="width:58px">Year <span class="th-sort">↕</span></th>
               <th style="width:78px">Language</th>
@@ -1410,6 +1411,9 @@ function renderItems() {
         <div class="text-clamp" style="max-width:200px;">${esc(item.title||'—')}</div>
         ${item.alt_title ? `<div style="font-size:11px;color:var(--text3);">${esc(item.alt_title)}</div>` : ''}
       </td>
+      <td class="cell-ident text-clamp">
+        <a href="https://archive.org/details/${esc(item.identifier)}" target="_blank" rel="noopener" onclick="event.stopPropagation()" title="Open on archive.org" style="color:var(--accent);text-decoration:none;font-size:12px;">${esc(item.identifier)}</a>
+      </td>
       <td class="cell-creator text-clamp">${esc(item.creator||item.author||'—')}</td>
       <td>${esc(item.year||'')}</td>
       <td>${item.detected_language ? `<span class="chip ${INDIAN_CODES.has(item.detected_language)?'indian':''}">${esc(item.detected_language)}</span>` : ''}</td>
@@ -2198,7 +2202,13 @@ async function api(url, method='GET', body=null) {
   if (body) opts.body = JSON.stringify(body);
   try {
     const r   = await fetch(url, opts);
-    const data = await r.json();
+    const ct  = r.headers.get('content-type') || '';
+    let data;
+    if (ct.includes('application/json')) {
+      data = await r.json();
+    } else {
+      data = {ok:false, error:`Server returned ${r.status} ${r.statusText} (non-JSON response)`};
+    }
     if (!r.ok || data.ok === false) {
       const errMsg = data.error || `HTTP ${r.status}`;
       _logOp(`✗ ${url}: ${errMsg}`, 'err');

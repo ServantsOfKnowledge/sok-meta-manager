@@ -857,6 +857,7 @@ def get_item(item_id):
     if not row:
         return None
     item = dict(row)
+    item["collection_id"] = coll_id
     if item.get("extra_metadata"):
         try:
             item["extra_metadata"] = json.loads(item["extra_metadata"])
