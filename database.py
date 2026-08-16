@@ -237,10 +237,13 @@ def _init_coll_conn(conn, identifier):
 
 def get_coll_db_conn(identifier):
     """Open (creating if needed) the per-collection DB for an identifier."""
-    conn = sqlite3.connect(_coll_path(identifier), timeout=30)
+    # Generous busy_timeout: large sync batches (which also touch the FTS
+    # index) can hold the write lock for a while — let other writers wait
+    # instead of failing with "database is locked".
+    conn = sqlite3.connect(_coll_path(identifier), timeout=60)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA busy_timeout=30000")
+    conn.execute("PRAGMA busy_timeout=60000")
     conn.execute("PRAGMA foreign_keys=ON")
     _init_coll_conn(conn, identifier)
     return conn
@@ -689,6 +692,118 @@ def upsert_item(collection_id, identifier, metadata_dict, ia_raw=None):
         conn.commit()
         _dirty_coll(collection_id)
         return item_id
+    finally:
+        conn.close()
+
+
+def batch_upsert_items(collection_id, items, ia_raw=True):
+    """Upsert a list of IA item metadata dicts using a single DB connection.
+    Much faster than calling upsert_item() per item for large syncs."""
+    import transliteration as T
+
+    items = [it for it in items if it.get("identifier")]
+    if not items:
+        return 0
+
+    conn = get_coll_db(collection_id)
+    try:
+        idents = list(dict.fromkeys(it["identifier"] for it in items))
+        marks = ",".join("?" * len(idents))
+        rows = conn.execute(
+            f"SELECT identifier, id, translit_status FROM items "
+            f"WHERE identifier IN ({marks})", idents,
+        ).fetchall()
+        existing = {r["identifier"]: dict(r) for r in rows}
+
+        max_row = conn.execute("SELECT MAX(id) FROM items").fetchone()[0]
+        local_seq = (max_row % ID_OFFSET) if max_row else 0
+
+        for item in items:
+            identifier = item["identifier"]
+            core = {f: item.get(f) for f in CORE_FIELDS}
+            core["downloads"] = item.get("downloads") or 0
+            extra = {k: v for k, v in item.items()
+                     if k not in CORE_FIELDS and k not in ('identifier', '_collections')}
+            core["extra_metadata"] = json.dumps(extra) if extra else None
+            core["ia_raw"]         = json.dumps(item) if ia_raw else None
+            core["last_synced"]    = datetime.utcnow().isoformat()
+            core["ia_updatedate"]  = item.get("updatedate") or item.get("publicdate")
+
+            raw_lang = item.get("language") or ""
+            detected = T.normalize_language(raw_lang) or T.normalize_language(identifier.split("-")[-1])
+            core["detected_language"] = detected
+
+            ex = existing.get(identifier)
+            if ex:
+                item_id = ex["id"]
+                if ex.get("translit_status") not in (None, "none"):
+                    core.pop("translit_status", None)
+                sets = ", ".join(f"{k}=?" for k in core)
+                conn.execute(f"UPDATE items SET {sets} WHERE id=?",
+                             list(core.values()) + [item_id])
+            else:
+                core["translit_status"] = "none"
+                local_seq += 1
+                item_id = collection_id * ID_OFFSET + local_seq
+                cols = ["id", "identifier"] + list(core.keys())
+                conn.execute(
+                    f"INSERT INTO items ({', '.join(cols)}) "
+                    f"VALUES ({', '.join('?' * len(cols))})",
+                    [item_id, identifier] + list(core.values()))
+
+            colls = item.get("_collections", [])
+            if colls:
+                conn.execute("DELETE FROM item_collections WHERE item_id=?", (item_id,))
+                conn.executemany(
+                    "INSERT OR IGNORE INTO item_collections (item_id, collection) VALUES (?,?)",
+                    [(item_id, cl) for cl in colls],
+                )
+            _fts_upsert(conn, item_id, item)
+            existing[identifier] = {"id": item_id,
+                                    "translit_status": core.get("translit_status")}
+
+        conn.commit()
+        _dirty_coll(collection_id)
+        return len(items)
+    finally:
+        conn.close()
+
+
+def collection_prefix_buckets(collection_id, n_buckets):
+    """Return a list of (prefix, count) identifier prefixes that partition the
+    collection's local items into ~``n_buckets`` roughly equal-sized groups.
+    Prefixes are prefix-free (no prefix is a prefix of another) and every item
+    matches exactly one, so ``identifier:{prefix}*`` queries partition the
+    whole collection.  Used to run independent IA scrape cursor chains in
+    parallel (one per prefix).
+
+    Returns [] when the collection is empty or too small to split.
+    """
+    from collections import deque
+
+    conn = get_coll_db(collection_id)
+    try:
+        total = conn.execute("SELECT COUNT(*) FROM items").fetchone()[0]
+        if total < n_buckets * 50:
+            return []
+        target = -(-total // n_buckets)  # ceil
+        buckets, queue = [], deque([("", total)])
+        while queue:
+            prefix, cnt = queue.popleft()
+            if cnt <= target:
+                if prefix:
+                    buckets.append((prefix, cnt))
+                continue
+            L = len(prefix)
+            rows = conn.execute(
+                "SELECT substr(identifier,1,?) AS p, COUNT(*) AS c FROM items "
+                "WHERE identifier >= ? AND identifier < ? || char(0x10FFFF) "
+                "GROUP BY p",
+                (L + 1, prefix, prefix),
+            ).fetchall()
+            for r in rows:
+                queue.append((r["p"], r["c"]))
+        return buckets
     finally:
         conn.close()
 

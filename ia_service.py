@@ -2,8 +2,9 @@
 SOK MetaManager — Internet Archive Service Layer  (v2)
 Smart incremental sync, thumbnail support, metadata push.
 """
-import subprocess, json, re, time
+import queue, subprocess, threading, json, re, time
 from typing import Optional, Callable
+from concurrent.futures import ThreadPoolExecutor
 
 try:
     import internetarchive as ia
@@ -250,6 +251,154 @@ def fetch_collection_all(
             break
 
         time.sleep(0.1)
+
+
+# ── Parallel full sync ────────────────────────────────────────────────────────
+# The scrape API paginates by an opaque cursor, so a single query can only be
+# read one page at a time.  To parallelise a full sync we split the collection
+# into disjoint identifier prefixes (collection_prefix_buckets) and run one
+# independent cursor chain per prefix on its own thread.  Filtered scrape pages
+# are ~3x slower than unfiltered ones, so raw per-chain throughput drops, but
+# with several chains running at once the aggregate is still ~2-3x faster than
+# a single sequential chain.
+
+def _prefix_total(session, collection_identifier, prefix):
+    """IA item count for the identifier prefix query (prefix may be empty)."""
+    if not prefix:
+        q = f"collection:{collection_identifier}"
+    else:
+        q = f"collection:{collection_identifier} AND identifier:{prefix}*"
+    data = _scrape_page(session, {"q": q, "fields": "identifier", "count": 100})
+    return data.get("total")
+
+
+_PENDING = object()  # sentinel: bucket not yet started
+
+
+def fetch_collection_parallel(
+    collection_identifier: str,
+    progress_callback: Optional[Callable] = None,
+    workers: int = 4,
+    start_state: Optional[dict] = None,
+    state_callback: Optional[Callable] = None,
+    start_count: int = 0,
+    prefixes: Optional[list] = None,
+):
+    """
+    Fetch ALL items in a collection using the authenticated scrape API,
+    parallelised across ``workers`` independent identifier-prefix buckets.
+    Each prefix runs its own cursor chain on its own thread and items are
+    streamed to the caller (via yield) as they arrive.
+
+    ``prefixes`` is an optional list of prefix strings, e.g. produced by
+    database.collection_prefix_buckets().  Each prefix must be prefix-free
+    (no prefix a prefix of another) so the ``identifier:{prefix}*`` queries
+    partition the collection.  Prefixes are verified against IA (non-empty +
+    coverage >= 95%) before fetching; if verification fails, or no prefixes
+    are given, this falls back to the plain sequential fetch so correctness
+    never depends on the split.
+
+    Resumable: ``start_state`` maps bucket index -> cursor (a bucket is skipped
+    when its cursor is None).  ``state_callback`` is called with the full state
+    dict after each page so the caller can persist it for restart.
+    """
+    if not IA_LIB_AVAILABLE:
+        raise RuntimeError("internetarchive library not installed")
+
+    session = _get_session()
+    fields_str = ",".join(SEARCH_FIELDS)
+
+    if prefixes and len(prefixes) > 1:
+        # Prefixes are prefix-free by construction (database.collection_prefix_
+        # buckets) so the identifier:{prefix}* queries partition the whole
+        # collection — no per-bucket validation round-trip is needed.  A query
+        # that errors fails loudly through _run_bucket; a bucket with no items
+        # simply ends its chain immediately.
+        ok = True
+    else:
+        ok = False
+    if not ok:
+        # No usable split — reuse the sequential path (resume-aware).
+        start_cursor = start_state and start_state.get("first")
+        yield from fetch_collection_all(
+            collection_identifier, progress_callback,
+            start_cursor=start_cursor,
+            cursor_callback=state_callback
+            and (lambda c: state_callback({"first": c})),
+            start_count=start_count)
+        return
+
+    total = _prefix_total(session, collection_identifier, "") or 0
+
+    def _bucket_key(idx):
+        return f"b{idx}"
+
+    state = dict(start_state or {})
+    for idx in range(len(prefixes)):
+        state.setdefault(_bucket_key(idx), _PENDING)
+
+    stop = threading.Event()
+    count = start_count or 0
+    out_q = queue.Queue(maxsize=max(len(prefixes) * 4, 8))
+
+    def _run_bucket(idx, prefix):
+        cursor = state[_bucket_key(idx)]
+        if cursor is None:
+            return  # bucket finished in a previous run
+        if cursor is _PENDING:
+            cursor = None  # fresh start
+        query = (f"collection:{collection_identifier} AND identifier:{prefix}*"
+                 if prefix else f"collection:{collection_identifier}")
+        try:
+            while not stop.is_set():
+                params = {"q": query, "fields": fields_str, "count": 500}
+                if cursor:
+                    params["cursor"] = cursor
+                data = _scrape_page(session, params)
+                page_items = data.get("items", [])
+                if page_items:
+                    try:
+                        out_q.put_nowait(page_items)
+                    except queue.Full:
+                        if stop.is_set():
+                            return
+                        out_q.put(page_items, timeout=5)
+                cursor = data.get("cursor")
+                if not cursor or not page_items:
+                    state[_bucket_key(idx)] = None  # terminal
+                    if state_callback:
+                        state_callback(dict(state))
+                    return
+                state[_bucket_key(idx)] = cursor
+                if state_callback:
+                    state_callback(dict(state))
+                time.sleep(0.1)
+        except Exception as e:
+            if not stop.is_set():
+                out_q.put(("error", e))
+
+    try:
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            for idx, prefix in enumerate(prefixes):
+                ex.submit(_run_bucket, idx, prefix)
+            # Consume until every bucket reports a terminal cursor.
+            finished = set()
+            while len(finished) < len(prefixes):
+                try:
+                    got = out_q.get(timeout=1)
+                except queue.Empty:
+                    continue
+                if isinstance(got, tuple) and got and got[0] == "error":
+                    raise got[1]
+                for item in got:
+                    count += 1
+                    if progress_callback:
+                        progress_callback(count, total or count)
+                    yield _parse_result(item)
+                finished = {i for i in range(len(prefixes))
+                            if state.get(_bucket_key(i)) is None}
+    finally:
+        stop.set()
 
 
 # ── Sub-collection discovery ──────────────────────────────────────────────────

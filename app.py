@@ -40,8 +40,37 @@ def err(msg, code=400):
 
 WORKER_THREADS = 3
 
+# Parallel IA fetch chains used inside a single full sync (each chain is an
+# independent scrape cursor query on a different identifier prefix).  Kept
+# modest to avoid tripping IA's request throttling; measured throughput at this
+# level is ~2-3x a single sequential chain.
+FETCH_WORKERS = 6
+
 _worker_started = False
 _worker_lock = threading.Lock()
+# In-process guard so a single collection is never touched by two workers at
+# once even if claim_next_job's DB-level check races across processes.
+_busy_collections = set()
+_busy_lock = threading.Lock()
+
+
+def _try_claim(job):
+    """Claim a job for dispatch, refusing to run two jobs for one collection
+    concurrently in this process."""
+    coll_id = job.get("collection_id")
+    if coll_id is not None:
+        with _busy_lock:
+            if coll_id in _busy_collections:
+                return False
+            _busy_collections.add(coll_id)
+    return True
+
+
+def _release_claim(job):
+    coll_id = job.get("collection_id")
+    if coll_id is not None:
+        with _busy_lock:
+            _busy_collections.discard(coll_id)
 
 
 def start_job_worker():
@@ -61,11 +90,19 @@ def _worker_loop():
         if job is None:
             time.sleep(1)
             continue
+        # A claim can go stale if another worker/process already took the
+        # collection meanwhile — verify before dispatching, then hold the
+        # collection until the job finishes so workers never overlap.
+        if not _try_claim(job):
+            time.sleep(1)
+            continue
         try:
             _dispatch_job(job)
         except Exception as e:
             db.fail_job(job["id"], str(e))
             db.add_job_log(job["id"], "err", f"Unhandled failure: {e}")
+        finally:
+            _release_claim(job)
 
 
 def _dispatch_job(job):
@@ -163,13 +200,21 @@ def _run_sync(job_id, coll_id, params, smart=False):
     class JobCancelled(Exception):
         pass
 
+    _prog_state = {"last": -1}
+
     def progress(cur, tot):
-        # Honor cancellation even while the fetch phase is still running.
-        if db.job_cancel_requested(job_id):
-            raise JobCancelled()
-        db.update_job_progress(job_id, cur, tot)
+        # Honor cancellation even while the fetch phase is still running, but
+        # throttle catalog DB writes: update_job_progress / job_cancel_requested
+        # open a connection per call, which caps a fast parallel fetch at a few
+        # hundred items/s.  The portal polls every few seconds, so persisting
+        # every ~250 items keeps the UI fresh without the per-item overhead.
         if coll_id in _sync_state:
             _sync_state[coll_id].update({"current": cur, "total": tot})
+        if cur - _prog_state["last"] >= 250 or cur == tot:
+            if db.job_cancel_requested(job_id):
+                raise JobCancelled()
+            db.update_job_progress(job_id, cur, tot)
+            _prog_state["last"] = cur
 
     def save_cursor(cursor):
         db.set_job_resume(job_id, "resume_cursor", cursor)
@@ -187,21 +232,48 @@ def _run_sync(job_id, coll_id, params, smart=False):
                 progress, start_cursor=resume_cursor, cursor_callback=save_cursor,
                 start_count=start_count)
         elif include_noindex:
-            items = ia_svc.fetch_collection_all(
-                coll["identifier"], progress, start_cursor=resume_cursor,
-                cursor_callback=save_cursor, start_count=start_count)
+            if resuming:
+                items = ia_svc.fetch_collection_all(
+                    coll["identifier"], progress, start_cursor=resume_cursor,
+                    cursor_callback=save_cursor, start_count=start_count)
+            else:
+                # Fresh full sync: split the identifier space into prefix
+                # buckets (from the local item distribution) and run one
+                # independent IA scrape cursor chain per prefix, in parallel.
+                # The scrape API has no way to page to an arbitrary offset, so
+                # concurrency must come from multiple queries.
+                prefixes = [p for p, _ in db.collection_prefix_buckets(coll_id, FETCH_WORKERS)]
+                if prefixes:
+                    db.add_job_log(job_id, "info",
+                                   f"Parallel fetch: {len(prefixes)} identifier prefixes")
+                items = ia_svc.fetch_collection_parallel(
+                    coll["identifier"], progress,
+                    workers=FETCH_WORKERS,
+                    start_state={"first": resume_cursor} if resume_cursor else None,
+                    prefixes=prefixes or None,
+                    start_count=start_count)
         else:
             items = ia_svc.fetch_collection_items(
                 coll["identifier"], progress, start_page=resume_page,
                 page_callback=save_page, start_count=start_count)
 
-        # Stream: persist each item as it arrives so the portal updates live.
+        # Stream: persist each item in batches as it arrives so the portal
+        # updates live.  Batching turns ~1.8M per-item DB connections into a
+        # handful of bulk writes — the dominant cost of a large full sync.
         # Cancellation is honoured via the progress callback raising JobCancelled.
         n = start_count
+        _BATCH = 500
+        batch = []
         for item in items:
             if item.get("identifier"):
-                db.upsert_item(coll_id, item["identifier"], item, ia_raw=item)
-                n += 1
+                batch.append(item)
+                if len(batch) >= _BATCH:
+                    db.batch_upsert_items(coll_id, batch)
+                    n += len(batch)
+                    batch = []
+        if batch:
+            db.batch_upsert_items(coll_id, batch)
+            n += len(batch)
 
         db.update_collection_sync(coll_id, db.get_stats(coll_id)["total"])
         _sync_done(job_id, coll_id, n, f"Synced {n} item(s) from '{coll['identifier']}'")
