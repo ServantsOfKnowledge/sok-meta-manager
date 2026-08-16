@@ -40,6 +40,11 @@ def err(msg, code=400):
 
 WORKER_THREADS = 3
 
+# Bump when a full/smart sync changes which items it fetches (e.g. hidden
+# noindex items via scope=all) so an interrupted run from an older version is
+# never "resumed" into a run that covers a different item set.
+SYNC_VERSION = 3
+
 # Parallel IA fetch chains used inside a single full sync (each chain is an
 # independent scrape cursor query on a different identifier prefix).  Kept
 # modest to avoid tripping IA's request throttling; measured throughput at this
@@ -183,6 +188,10 @@ def _run_sync(job_id, coll_id, params, smart=False):
     include_noindex = bool(params.get("include_noindex"))
     mode = "smart" if smart else ("full-noindex" if include_noindex else "full")
     job_row = db.get_job(job_id) or {}
+    # Stamp the sync version on this job so a future interrupted run only
+    # resumes from jobs that fetched the same item set (older versions did not
+    # fetch hidden noindex items via scope=all).
+    db.set_job_resume(job_id, "sync_version", SYNC_VERSION)
     start_count   = int(job_row.get("current") or params.get("resume_current") or 0)
     resume_cursor = params.get("resume_cursor")
     resume_page   = params.get("resume_page")
@@ -596,7 +605,8 @@ def api_sync_collection(coll_id):
     db.cancel_queued_syncs(coll_id, "full-sync")
     params = {"include_noindex": include_noindex}
     # Resume from the most recent failed sync of the same type if available
-    resume = db.latest_sync_resume(coll_id, "full-sync", include_noindex=include_noindex)
+    resume = db.latest_sync_resume(coll_id, "full-sync", include_noindex=include_noindex,
+                                   sync_version=SYNC_VERSION)
     if resume:
         for k in ("resume_cursor", "resume_page"):
             if k in resume:
@@ -628,7 +638,7 @@ def api_smart_sync(coll_id):
     db.cancel_queued_syncs(coll_id, "smart-sync")
     params = {"since": since, "include_noindex": body.get("include_noindex", False)}
     # Resume from the most recent failed sync of the same type if available
-    resume = db.latest_sync_resume(coll_id, "smart-sync")
+    resume = db.latest_sync_resume(coll_id, "smart-sync", sync_version=SYNC_VERSION)
     if resume:
         for k in ("resume_cursor", "resume_page"):
             if k in resume:

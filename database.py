@@ -1527,10 +1527,16 @@ def set_job_resume(job_id, key, value):
         conn.close()
 
 
-def latest_sync_resume(coll_id, job_type, include_noindex=None):
+def latest_sync_resume(coll_id, job_type, include_noindex=None, sync_version=None):
     """Return resume markers from the most recent failed/interrupted sync of the
     same type, so a freshly queued sync can continue instead of repeating work
-    already done.  Returns {'current','resume_cursor','resume_page'} or None."""
+    already done.  Returns {'current','resume_cursor','resume_page'} or None.
+
+    ``sync_version``: when given, only resumes from jobs that ran under the same
+    sync version are honoured — an interrupted run from an older code version
+    (e.g. one that did not yet fetch hidden noindex items) fetched a different
+    item set, so continuing from its cursor would silently skip items the new
+    version is supposed to cover."""
     conn = get_db()
     try:
         if include_noindex is None:
@@ -1555,6 +1561,8 @@ def latest_sync_resume(coll_id, job_type, include_noindex=None):
                     params = json.loads(row["params"])
                 except Exception:
                     params = {}
+            if sync_version is not None and params.get("sync_version") != sync_version:
+                continue
             out = {"current": int(row["current"] or 0)}
             if params.get("resume_cursor"):
                 out["resume_cursor"] = params["resume_cursor"]
