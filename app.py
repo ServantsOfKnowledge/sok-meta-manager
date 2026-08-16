@@ -230,12 +230,13 @@ def _run_sync(job_id, coll_id, params, smart=False):
             items = ia_svc.fetch_updated_items(
                 coll["identifier"], params.get("since") or coll.get("last_synced"),
                 progress, start_cursor=resume_cursor, cursor_callback=save_cursor,
-                start_count=start_count)
+                start_count=start_count, include_noindex=include_noindex)
         elif include_noindex:
             if resuming:
                 items = ia_svc.fetch_collection_all(
                     coll["identifier"], progress, start_cursor=resume_cursor,
-                    cursor_callback=save_cursor, start_count=start_count)
+                    cursor_callback=save_cursor, start_count=start_count,
+                    include_noindex=include_noindex)
             else:
                 # Fresh full sync: split the identifier space into prefix
                 # buckets (from the local item distribution) and run one
@@ -251,7 +252,8 @@ def _run_sync(job_id, coll_id, params, smart=False):
                     workers=FETCH_WORKERS,
                     start_state={"first": resume_cursor} if resume_cursor else None,
                     prefixes=prefixes or None,
-                    start_count=start_count)
+                    start_count=start_count,
+                    include_noindex=include_noindex)
         else:
             items = ia_svc.fetch_collection_items(
                 coll["identifier"], progress, start_page=resume_page,

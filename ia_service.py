@@ -42,6 +42,7 @@ SEARCH_FIELDS = [
     "licenseurl", "mediatype", "volume", "isbn", "source",
     "collection", "updatedate", "publicdate", "downloads",
 ]
+_SCOPE_ALL = "all"  # scrape/advancedsearch param that includes noindex/hidden items
 
 def fetch_collection_items(
     collection_identifier: str,
@@ -109,6 +110,7 @@ def fetch_updated_items(
     start_cursor: Optional[str] = None,
     cursor_callback: Optional[Callable] = None,
     start_count: int = 0,
+    include_noindex: bool = False,
 ):
     """
     Smart incremental sync: fetch only items updated on IA after since_date.
@@ -147,6 +149,8 @@ def fetch_updated_items(
             "fields": fields_str,
             "count":  500,
         }
+        if include_noindex:
+            params["scope"] = _SCOPE_ALL
         if cursor:
             params["cursor"] = cursor
 
@@ -203,6 +207,7 @@ def fetch_collection_all(
     start_cursor: Optional[str] = None,
     cursor_callback: Optional[Callable] = None,
     start_count: int = 0,
+    include_noindex: bool = False,
 ):
     """
     Fetch ALL items in a collection using IA's authenticated scrape API.
@@ -228,6 +233,8 @@ def fetch_collection_all(
             "fields": fields_str,
             "count": 500,
         }
+        if include_noindex:
+            params["scope"] = _SCOPE_ALL
         if cursor:
             params["cursor"] = cursor
 
@@ -262,13 +269,16 @@ def fetch_collection_all(
 # with several chains running at once the aggregate is still ~2-3x faster than
 # a single sequential chain.
 
-def _prefix_total(session, collection_identifier, prefix):
+def _prefix_total(session, collection_identifier, prefix, include_noindex=False):
     """IA item count for the identifier prefix query (prefix may be empty)."""
     if not prefix:
         q = f"collection:{collection_identifier}"
     else:
         q = f"collection:{collection_identifier} AND identifier:{prefix}*"
-    data = _scrape_page(session, {"q": q, "fields": "identifier", "count": 100})
+    params = {"q": q, "fields": "identifier", "count": 100}
+    if include_noindex:
+        params["scope"] = _SCOPE_ALL
+    data = _scrape_page(session, params)
     return data.get("total")
 
 
@@ -283,6 +293,7 @@ def fetch_collection_parallel(
     state_callback: Optional[Callable] = None,
     start_count: int = 0,
     prefixes: Optional[list] = None,
+    include_noindex: bool = False,
 ):
     """
     Fetch ALL items in a collection using the authenticated scrape API,
@@ -325,10 +336,12 @@ def fetch_collection_parallel(
             start_cursor=start_cursor,
             cursor_callback=state_callback
             and (lambda c: state_callback({"first": c})),
-            start_count=start_count)
+            start_count=start_count,
+            include_noindex=include_noindex)
         return
 
-    total = _prefix_total(session, collection_identifier, "") or 0
+    total = _prefix_total(session, collection_identifier, "",
+                          include_noindex=include_noindex) or 0
 
     def _bucket_key(idx):
         return f"b{idx}"
@@ -352,6 +365,8 @@ def fetch_collection_parallel(
         try:
             while not stop.is_set():
                 params = {"q": query, "fields": fields_str, "count": 500}
+                if include_noindex:
+                    params["scope"] = _SCOPE_ALL
                 if cursor:
                     params["cursor"] = cursor
                 data = _scrape_page(session, params)
@@ -375,13 +390,21 @@ def fetch_collection_parallel(
                 time.sleep(0.1)
         except Exception as e:
             if not stop.is_set():
-                out_q.put(("error", e))
+                try:
+                    out_q.put(("error", e), timeout=5)
+                except queue.Full:
+                    pass  # consumer is gone (cancelled) — nothing to report
 
     try:
         with ThreadPoolExecutor(max_workers=workers) as ex:
             for idx, prefix in enumerate(prefixes):
                 ex.submit(_run_bucket, idx, prefix)
-            # Consume until every bucket reports a terminal cursor.
+            # Consume until every bucket reports a terminal cursor.  A global
+            # seen-set guarantees each identifier is yielded exactly once even
+            # if two bucket queries overlap on IA (e.g. its case-insensitive
+            # identifier matching): duplicates are dropped here so the count
+            # and the DB stay truthful.
+            seen = set()
             finished = set()
             while len(finished) < len(prefixes):
                 try:
@@ -391,10 +414,16 @@ def fetch_collection_parallel(
                 if isinstance(got, tuple) and got and got[0] == "error":
                     raise got[1]
                 for item in got:
+                    rec = _parse_result(item)
+                    ident = rec.get("identifier") if isinstance(rec, dict) else None
+                    if ident:
+                        if ident in seen:
+                            continue
+                        seen.add(ident)
                     count += 1
                     if progress_callback:
                         progress_callback(count, total or count)
-                    yield _parse_result(item)
+                    yield rec
                 finished = {i for i in range(len(prefixes))
                             if state.get(_bucket_key(i)) is None}
     finally:

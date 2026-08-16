@@ -795,11 +795,17 @@ def collection_prefix_buckets(collection_id, n_buckets):
                     buckets.append((prefix, cnt))
                 continue
             L = len(prefix)
+            # Case-fold the split so identifiers differing only in case land in
+            # the same bucket: IA's ``identifier:{prefix}*`` filter matches
+            # case-insensitively, so separate upper/lower buckets (e.g. 'A' and
+            # 'a') would otherwise overlap on IA and fetch the same items twice.
+            # Children are the folded (L+1)-char prefixes of identifiers whose
+            # folded first-L chars equal this node, which partitions the exact
+            # set covered by this node (no range predicate, so no gaps).
             rows = conn.execute(
-                "SELECT substr(identifier,1,?) AS p, COUNT(*) AS c FROM items "
-                "WHERE identifier >= ? AND identifier < ? || char(0x10FFFF) "
-                "GROUP BY p",
-                (L + 1, prefix, prefix),
+                "SELECT LOWER(substr(identifier,1,?)) AS p, COUNT(*) AS c "
+                "FROM items WHERE LOWER(substr(identifier,1,?)) = ? GROUP BY p",
+                (L + 1, L, prefix),
             ).fetchall()
             for r in rows:
                 queue.append((r["p"], r["c"]))
