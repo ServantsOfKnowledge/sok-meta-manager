@@ -25,6 +25,7 @@ import sqlite3
 import threading
 import time
 import heapq
+import unicodedata
 from datetime import datetime
 
 DB_PATH       = os.path.join(os.path.dirname(__file__), "data", "sok_metadata.db")
@@ -100,10 +101,128 @@ def fts_supported():
     return _FTS_OK
 
 
+_FTS_COLS = ["identifier", "title", "creator", "author", "publisher",
+             "subject", "description", "alt_title", "alt_creator",
+             "alt_author", "alt_publisher"]
+
+# Indian scripts a romanized query can be expanded into (mirrors
+# transliteration.py's script map so both English and script searches hit).
+_FTS_SCRIPT_NAMES = ["DEVANAGARI", "KANNADA", "TELUGU", "TAMIL",
+                     "MALAYALAM", "BENGALI", "GUJARATI", "GURMUKHI", "ORIYA"]
+
+
+def _norm_token(tok):
+    """Lowercase a token and fold Latin diacritics (śrī → sri) while leaving
+    real non-Latin scripts (Devanagari, etc.) untouched."""
+    if tok.isascii():
+        return tok.lower()
+    folded = unicodedata.normalize("NFD", tok)
+    folded = "".join(c for c in folded if unicodedata.category(c) != "Mn")
+    return folded.lower() if folded.isascii() else tok
+
+
+def _latin_variants(tok):
+    """Latin token → itself plus Indian-script spellings, so a romanized
+    search like ``ramayana`` can also match ``रामायण``.
+
+    Casual romanization never encodes vowel length, so each ambiguous Vowel
+    (a/i/u) is tried in both short and long forms (gita → gita/gitā/gīta/gītā)
+    before transliterating; every candidate is transliterated into the
+    supported Indian scripts."""
+    out = [tok]
+    if not tok or not tok.isalpha() or len(tok) < 3 or len(tok) > 40:
+        return out
+    positions = [i for i, ch in enumerate(tok) if ch in "aiu"]
+    if not positions:
+        return out
+    longmap = {"a": "ā", "i": "ī", "u": "ū"}
+    k = len(positions)
+    if k > 5:
+        powers = {0, (1 << k) - 1} | {1 << i for i in range(k)}
+        powers |= {sum(1 << i for i in range(k // 2)),
+                   sum(1 << i for i in range(k // 2, k))}
+        masks = sorted(powers)
+    else:
+        masks = range(1 << k)
+    cands = set()
+    for mask in masks:
+        chars = list(tok)
+        for bi, p in enumerate(positions):
+            if (mask >> bi) & 1:
+                chars[p] = longmap[tok[p]]
+        cands.add("".join(chars))
+    try:
+        from indic_transliteration import sanscript
+    except Exception:
+        return out
+    for cand in cands:
+        for name in _FTS_SCRIPT_NAMES:
+            try:
+                v = sanscript.transliterate(cand, sanscript.IAST,
+                                            getattr(sanscript, name))
+            except Exception:
+                continue
+            if v and v != tok:
+                out.append(v)
+    return out
+
+
 def _fts_query(q):
-    """Turn a plain search string into an FTS5 MATCH expression (safe)."""
-    tokens = [t for t in re.findall(r"[A-Za-z0-9]+", q.lower()) if len(t) >= 2]
-    return " AND ".join('"{}"'.format(t) for t in tokens) if tokens else None
+    """Turn a plain search string into FTS5 MATCH expressions.
+
+    Returns ``(pos_expr, neg_exprs)`` where ``pos_expr`` is a positive-only
+    MATCH expression (quoted phrases, required ``+`` tokens, ``OR`` groups,
+    auto-prefixed ``tok*`` and Indian-script variants) and ``neg_exprs`` is a
+    list of MATCH expressions, one per ``-`` token (each an OR of that token's
+    script variants).  Exclusions are negated at the SQL layer with ``NOT IN
+    (SELECT rowid FROM items_fts WHERE items_fts MATCH ?)`` because FTS5's
+    boolean ``NOT`` operator cannot take OR-expressions and its precedence is
+    fragile around left operands.  Every term is double-quoted so user input
+    can never inject FTS5 syntax."""
+    if not q or not q.strip():
+        return None, []
+    text = q
+    quotes = re.findall(r'"[^"]*"', q)
+    for phrase in quotes:
+        text = text.replace(phrase, " ", 1)
+
+    pos_groups, neg_exprs = [], []
+    or_pending = False
+    for raw in re.findall(r"[+\-]?\S+", text):
+        if raw.lower() == "or":
+            or_pending = True
+            continue
+        raw = raw.rstrip(".,;:")
+        if not raw:
+            continue
+        negate = raw.startswith("-")
+        token = _norm_token(raw.lstrip("+-"))
+        if not token or len(token) < 2:
+            continue
+        variants = _latin_variants(token) if token.isascii() else [token]
+        group = " OR ".join(f'"{v}"*' for v in dict.fromkeys(variants))
+        if not group:
+            continue
+        if negate:
+            neg_exprs.append(group)
+            or_pending = False
+            continue
+        if or_pending and pos_groups:
+            pos_groups[-1] = f"({pos_groups[-1]}) OR ({group})"
+        else:
+            pos_groups.append(group)
+        or_pending = False
+
+    for phrase in quotes:
+        inner = _norm_token(phrase[1:-1].strip())
+        if inner:
+            pos_groups.append(f'"{inner}"')
+            or_pending = False
+
+    pos = None
+    if pos_groups:
+        pos = " AND ".join(f"({g})" for g in pos_groups)
+    return pos, neg_exprs
 
 
 # ── Identifier / path resolution ──────────────────────────────────────────────
@@ -206,12 +325,20 @@ CREATE TABLE IF NOT EXISTS review_batches (
     status        TEXT    DEFAULT 'exported'
 );
 
-CREATE INDEX IF NOT EXISTS idx_items_identifier ON items(identifier);
-CREATE INDEX IF NOT EXISTS idx_items_modified   ON items(is_modified);
-CREATE INDEX IF NOT EXISTS idx_items_pushed     ON items(is_pushed);
-CREATE INDEX IF NOT EXISTS idx_items_lang       ON items(detected_language);
-CREATE INDEX IF NOT EXISTS idx_items_tstatus    ON items(translit_status);
-CREATE INDEX IF NOT EXISTS idx_ic_collection    ON item_collections(collection);
+CREATE INDEX IF NOT EXISTS idx_items_identifier   ON items(identifier);
+CREATE INDEX IF NOT EXISTS idx_items_modified     ON items(is_modified);
+CREATE INDEX IF NOT EXISTS idx_items_pushed       ON items(is_pushed);
+CREATE INDEX IF NOT EXISTS idx_items_lang         ON items(detected_language);
+CREATE INDEX IF NOT EXISTS idx_items_tstatus      ON items(translit_status);
+CREATE INDEX IF NOT EXISTS idx_items_title        ON items(title);
+CREATE INDEX IF NOT EXISTS idx_items_creator      ON items(creator);
+CREATE INDEX IF NOT EXISTS idx_items_author       ON items(author);
+CREATE INDEX IF NOT EXISTS idx_items_publisher    ON items(publisher);
+CREATE INDEX IF NOT EXISTS idx_items_date         ON items(date);
+CREATE INDEX IF NOT EXISTS idx_items_year         ON items(year);
+CREATE INDEX IF NOT EXISTS idx_items_last_synced  ON items(last_synced);
+CREATE INDEX IF NOT EXISTS idx_items_last_modified ON items(last_modified);
+CREATE INDEX IF NOT EXISTS idx_ic_collection      ON item_collections(collection);
 """
 
 
@@ -233,13 +360,26 @@ def _init_coll_conn(conn, identifier):
         ]:
             _safe_add_column(c, "items", col, typedef)
         if fts_supported():
-            try:
-                c.execute("CREATE VIRTUAL TABLE IF NOT EXISTS items_fts "
-                          "USING fts5(identifier, title, creator, author, publisher, subject)")
-            except Exception:
-                pass
+            _fts_ensure_conn(c)
         conn.commit()
         _COLL_SCHEMAS.add(identifier)
+
+
+def _fts_ensure_conn(conn):
+    """Create the FTS5 table with the current column set, rebuilding (and
+    repopulating) it when the schema version has changed."""
+    try:
+        existing = [r[1] for r in conn.execute("PRAGMA table_info(items_fts)")]
+    except Exception:
+        existing = []
+    if existing != _FTS_COLS:
+        try:
+            conn.execute("DROP TABLE IF EXISTS items_fts")
+        except Exception:
+            pass
+        conn.execute("CREATE VIRTUAL TABLE items_fts "
+                     "USING fts5(" + ", ".join(_FTS_COLS) + ")")
+        _fts_rebuild_conn(conn)
 
 
 def get_coll_db_conn(identifier):
@@ -335,14 +475,14 @@ def _fts_rebuild_conn(conn):
         conn.execute("DROP TABLE IF EXISTS items_fts")
     except Exception:
         pass
-    conn.execute("CREATE VIRTUAL TABLE items_fts "
-                 "USING fts5(identifier, title, creator, author, publisher, subject)")
+    cols = ", ".join(_FTS_COLS)
+    conn.execute(f"CREATE VIRTUAL TABLE items_fts USING fts5({cols})")
     rows = conn.execute(
-        "SELECT id, identifier, title, creator, author, publisher, subject FROM items"
+        "SELECT id, " + cols + " FROM items"
     ).fetchall()
     conn.executemany(
-        "INSERT INTO items_fts (rowid, identifier, title, creator, author, publisher, subject) "
-        "VALUES (?,?,?,?,?,?,?)",
+        "INSERT INTO items_fts (rowid, " + cols + ") "
+        "VALUES (?," + ",".join("?" * len(_FTS_COLS)) + ")",
         [tuple(r) for r in rows],
     )
     conn.commit()
@@ -631,12 +771,11 @@ def _fts_upsert(conn, item_id, metadata_dict):
         return
     try:
         conn.execute("DELETE FROM items_fts WHERE rowid=?", (item_id,))
+        vals = [metadata_dict.get(col) for col in _FTS_COLS]
         conn.execute(
-            "INSERT INTO items_fts (rowid, identifier, title, creator, author, publisher, subject) "
-            "VALUES (?,?,?,?,?,?,?)",
-            (item_id, metadata_dict.get("identifier"), metadata_dict.get("title"),
-             metadata_dict.get("creator"), metadata_dict.get("author"),
-             metadata_dict.get("publisher"), metadata_dict.get("subject")),
+            "INSERT INTO items_fts (rowid, " + ", ".join(_FTS_COLS) + ") "
+            "VALUES (?," + ",".join("?" * len(_FTS_COLS)) + ")",
+            [item_id] + vals,
         )
     except Exception:
         try:
@@ -939,11 +1078,17 @@ def list_items(collection_id, search=None, modified_only=False,
     if translit_status:
         where.append("i.translit_status=?")
         params.append(translit_status)
+    fts_match = None
     if search:
-        fq = _fts_query(search)
-        if fts_supported() and fq:
-            where.append("i.id IN (SELECT rowid FROM items_fts WHERE items_fts MATCH ?)")
-            params.append(fq)
+        pos_expr, neg_exprs = _fts_query(search)
+        if fts_supported() and (pos_expr or neg_exprs):
+            if pos_expr:
+                fts_match = pos_expr
+                where.append("i.id IN (SELECT rowid FROM items_fts WHERE items_fts MATCH ?)")
+                params.append(pos_expr)
+            for ng in neg_exprs:
+                where.append("i.id NOT IN (SELECT rowid FROM items_fts WHERE items_fts MATCH ?)")
+                params.append(ng)
         else:
             where.append(
                 "(i.title LIKE ? OR i.identifier LIKE ? OR i.creator LIKE ? "
@@ -955,9 +1100,11 @@ def list_items(collection_id, search=None, modified_only=False,
     where_sql = " AND ".join(where) if where else "1=1"
 
     allowed = {"title", "identifier", "creator", "author", "publisher",
-               "date", "year", "last_modified", "last_synced", "detected_language"}
+               "date", "year", "last_modified", "last_synced",
+               "detected_language", "rank", "relevance"}
     if sort not in allowed:
         sort = "title"
+    relevance = sort in ("rank", "relevance")
     direction = "DESC" if sort_dir.lower() == "desc" else "ASC"
     offset = (page - 1) * per_page
 
@@ -965,15 +1112,30 @@ def list_items(collection_id, search=None, modified_only=False,
         f"SELECT COUNT(*) FROM items i WHERE {where_sql}", params
     ).fetchone()[0]
 
+    ft_join = ""
+    if relevance and fts_match:
+        # Join the FTS5 matched set so the bm25 ``rank`` column (lower = better)
+        # drives the ordering; this lives in FROM so its placeholder binds first.
+        ft_join = ("JOIN (SELECT rowid AS rid, rank AS ft_rank FROM items_fts "
+                   "WHERE items_fts MATCH ?) ft ON ft.rid=i.id")
+        order_expr = "ft.ft_rank ASC"
+        sel_params = [fts_match] + params + [per_page, offset]
+    else:
+        if relevance and not fts_match:
+            order_expr = "i.title ASC"
+        else:
+            order_expr = f"i.{sort} {direction} NULLS LAST"
+        sel_params = params + [per_page, offset]
+
     rows = conn.execute(
-        f"""SELECT i.*, GROUP_CONCAT(ic.collection,'||') as collections
-            FROM items i
-            LEFT JOIN item_collections ic ON ic.item_id=i.id
+        f"""SELECT i.*,
+                   (SELECT GROUP_CONCAT(collection,'||') FROM item_collections ic
+                    WHERE ic.item_id = i.id) AS collections
+            FROM items i {ft_join}
             WHERE {where_sql}
-            GROUP BY i.id
-            ORDER BY i.{sort} {direction} NULLS LAST
+            ORDER BY {order_expr}
             LIMIT ? OFFSET ?""",
-        params + [per_page, offset],
+        sel_params,
     ).fetchall()
 
     conn.close()

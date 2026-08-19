@@ -948,6 +948,7 @@ const S = {
   page:             1,
   sort:             'title',
   sortDir:          'asc',
+  userSort:         false, // true once the user explicitly clicks a sort column
   activeItem:       null,
   syncTimer:        null,
   langData:         [],
@@ -1435,7 +1436,15 @@ function setTab(el, tab) {
 let _searchTimer = null;
 function debounceSearch() {
   clearTimeout(_searchTimer);
-  _searchTimer = setTimeout(()=>{ S.page=1; loadItems(isModifiedTab()); updateActiveFiltersBar(); }, 280);
+  _searchTimer = setTimeout(()=>{
+    const q = document.getElementById('search-input').value.trim();
+    // Until the user explicitly clicks a column, searches rank by relevance.
+    if (!S.userSort) {
+      S.sort = q ? 'rank' : 'title';
+      S.sortDir = 'asc';
+    }
+    S.page=1; loadItems(isModifiedTab()); updateActiveFiltersBar();
+  }, 280);
 }
 
 function applyFilters() { S.page=1; loadItems(isModifiedTab()); updateActiveFiltersBar(); }
@@ -1444,6 +1453,7 @@ function clearFilters() {
   document.getElementById('lang-filter').value='';
   document.getElementById('tstatus-filter').value='';
   document.getElementById('not-col-filter').value='';
+  S.userSort = false; S.sort = 'title'; S.sortDir = 'asc';
   applyFilters();
 }
 
@@ -1453,6 +1463,7 @@ function resetListFilters() {
   S.page = 1;
   S.sort = 'title';
   S.sortDir = 'asc';
+  S.userSort = false;
   const si = document.getElementById('search-input'); if (si) si.value = '';
   const lf = document.getElementById('lang-filter');  if (lf) lf.value = '';
   const tf = document.getElementById('tstatus-filter'); if (tf) tf.value = '';
@@ -1478,6 +1489,7 @@ function updateActiveFiltersBar() {
   const nf = document.getElementById('not-col-filter');
   const chips = [];
   if (q)         chips.push(`Search: "${q}"`);
+  if (S.sort==='rank') chips.push('Sorted by relevance');
   if (ln.value)  chips.push(`Language: ${ln.options[ln.selectedIndex]?.text}`);
   if (ts.value)  chips.push(`Translit: ${ts.value}`);
   if (nf.value)  chips.push(`Not in: ${nf.value}`);
@@ -1656,6 +1668,7 @@ function renderPagination(total, page, perPage) {
 function goPage(p) { S.page=p; loadItems(isModifiedTab()); }
 
 function setSort(field) {
+  S.userSort = true;
   if (S.sort===field) S.sortDir=S.sortDir==='asc'?'desc':'asc';
   else { S.sort=field; S.sortDir='asc'; }
   document.querySelectorAll('th').forEach(t=>{ t.classList.remove('sorted'); const s=t.querySelector('.th-sort'); if(s) s.textContent='↕'; });
