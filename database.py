@@ -24,6 +24,7 @@ import re
 import sqlite3
 import threading
 import time
+import heapq
 from datetime import datetime
 
 DB_PATH       = os.path.join(os.path.dirname(__file__), "data", "sok_metadata.db")
@@ -66,6 +67,11 @@ def cache_put(key, value, ttl=_DEFAULT_TTL):
 def cache_clear():
     with _CACHE_LOCK:
         _CACHE.clear()
+
+
+def cache_del(key):
+    with _CACHE_LOCK:
+        _CACHE.pop(key, None)
 
 
 def _dirty_coll(collection_id):
@@ -223,6 +229,7 @@ def _init_coll_conn(conn, identifier):
             ("downloads",         "INTEGER DEFAULT 0"),
             ("views_30d",         "INTEGER DEFAULT 0"),
             ("views_7d",          "INTEGER DEFAULT 0"),
+            ("imagecount",        "INTEGER DEFAULT 0"),
         ]:
             _safe_add_column(c, "items", col, typedef)
         if fts_supported():
@@ -651,6 +658,7 @@ def upsert_item(collection_id, identifier, metadata_dict, ia_raw=None):
 
         core = {f: metadata_dict.get(f) for f in CORE_FIELDS}
         core["downloads"] = metadata_dict.get("downloads") or 0
+        core["imagecount"] = metadata_dict.get("imagecount") or 0
         extra = {k: v for k, v in metadata_dict.items()
                  if k not in CORE_FIELDS and k not in ('identifier', '_collections')}
         core["extra_metadata"] = json.dumps(extra) if extra else None
@@ -722,6 +730,7 @@ def batch_upsert_items(collection_id, items, ia_raw=True):
             identifier = item["identifier"]
             core = {f: item.get(f) for f in CORE_FIELDS}
             core["downloads"] = item.get("downloads") or 0
+            core["imagecount"] = item.get("imagecount") or 0
             extra = {k: v for k, v in item.items()
                      if k not in CORE_FIELDS and k not in ('identifier', '_collections')}
             core["extra_metadata"] = json.dumps(extra) if extra else None
@@ -1179,6 +1188,20 @@ def update_item_stats_batch(collection_id, stats_map):
         conn.close()
 
 
+def update_item_imagecount_batch(collection_id, pages_map):
+    """Write IA page counts (imagecount) keyed by identifier in one connection."""
+    conn = get_coll_db(collection_id)
+    try:
+        conn.executemany(
+            "UPDATE items SET imagecount=? WHERE identifier=?",
+            [(int(c or 0), ident) for ident, c in pages_map.items()],
+        )
+        conn.commit()
+        _dirty_coll(collection_id)
+    finally:
+        conn.close()
+
+
 def get_modified_items(collection_id):
     conn = get_coll_db(collection_id)
     try:
@@ -1225,6 +1248,160 @@ def get_stats(collection_id, ia_collection=None):
            "pending_push": modified - pushed}
     cache_put(key, out, 3)
     return out
+
+
+def _collection_impact(coll_id):
+    """Aggregate impact metrics for one collection's items DB.
+
+    Uses a single forward scan so huge collections (multi-GB SQLite files)
+    cost one pass instead of a dozen aggregate/full-sort queries."""
+    conn = get_coll_db(coll_id)
+    rows = conn.execute(
+        "SELECT identifier, title, detected_language, downloads, views_30d, "
+        "views_7d, imagecount, is_modified, is_pushed FROM items"
+    )
+    langs: dict = {}
+    top_dl: list = []
+    top_views: list = []
+    items = pages = pages_items = downloads = views_30d = views_7d = 0
+    modified = pushed = 0
+    seq = 0
+
+    def _push_top(heap, row, key, seq):
+        heapq.heappush(heap, (row[key], seq, row))
+        if len(heap) > 15:
+            heapq.heappop(heap)
+
+    for ident, title, lang, dl, v30, v7, ic, mod, push in rows:
+        items += 1
+        if dl or lang or ic or v30 or v7:
+            r = {"identifier": ident, "title": title, "lang": lang,
+                 "downloads": dl or 0, "views_30d": v30 or 0,
+                 "views_7d": v7 or 0, "imagecount": ic or 0}
+            if dl:
+                downloads += dl
+                _push_top(top_dl, r, "downloads", seq)
+            if v30:
+                views_30d += v30
+                _push_top(top_views, r, "views_30d", seq)
+            if v7:
+                views_7d += v7
+            if ic:
+                pages += ic
+                pages_items += 1
+            if lang:
+                langs[lang] = langs.get(lang, 0) + 1
+            seq += 1
+        if mod:
+            modified += 1
+        if push:
+            pushed += 1
+    conn.close()
+    return {
+        "items": items, "pages": pages, "pages_items": pages_items,
+        "downloads": downloads, "views_30d": views_30d, "views_7d": views_7d,
+        "modified": modified, "pushed": pushed,
+        "n_languages": len(langs),
+        "languages": langs,
+        "top_downloads": [r for _, _, r in sorted(top_dl, reverse=True)],
+        "top_views":     [r for _, _, r in sorted(top_views, reverse=True)],
+    }
+
+
+def get_impact_stats():
+    """Aggregate impact metrics across every stored collection (items, pages,
+    languages, views/downloads, pipeline progress) for the stats dashboard."""
+    key = ("impact",)
+    cached = cache_get(key)
+    if cached is not None:
+        return cached
+    per_collection = []
+    totals = {"items": 0, "pages": 0, "pages_items": 0, "downloads": 0,
+              "views_30d": 0, "views_7d": 0, "modified": 0, "pushed": 0}
+    lang_counts: dict = {}
+    top_dl: list = []
+    top_views: list = []
+
+    for coll in list_collections():
+        try:
+            s = _collection_impact(coll["id"])
+        except Exception:
+            continue
+        for k in totals:
+            totals[k] += s[k]
+        for lang, cnt in s["languages"].items():
+            lang_counts[lang] = lang_counts.get(lang, 0) + cnt
+        top_dl.extend(s["top_downloads"])
+        top_views.extend(s["top_views"])
+        per_collection.append({
+            "id": coll["id"], "name": coll["name"], "identifier": coll["identifier"],
+            "items": s["items"], "pages": s["pages"], "pages_items": s["pages_items"],
+            "downloads": s["downloads"], "views_30d": s["views_30d"],
+            "views_7d": s["views_7d"], "languages": s["n_languages"],
+            "modified": s["modified"], "pushed": s["pushed"],
+        })
+
+    top_dl.sort(key=lambda r: r["downloads"], reverse=True)
+    top_views.sort(key=lambda r: r["views_30d"], reverse=True)
+    out = {
+        "collections": len(per_collection),
+        "items": totals["items"], "pages": totals["pages"],
+        "pages_items": totals["pages_items"],
+        "downloads": totals["downloads"], "views_30d": totals["views_30d"],
+        "views_7d": totals["views_7d"], "modified": totals["modified"],
+        "pushed": totals["pushed"], "pending_push": totals["modified"] - totals["pushed"],
+        "languages": len(lang_counts),
+        "top_languages": sorted(lang_counts.items(), key=lambda kv: kv[1], reverse=True)[:20],
+        "top_downloads": top_dl[:10],
+        "top_views": top_views[:10],
+        "per_collection": per_collection,
+    }
+    cache_put(key, out, 5)
+    return out
+
+
+# ── Impact snapshot (persisted, so the expensive aggregate survives restarts) ─
+
+def _impact_snapshot_init(c):
+    c.execute(
+        "CREATE TABLE IF NOT EXISTS impact_snapshot ("
+        " id INTEGER PRIMARY KEY CHECK (id=1),"
+        " payload TEXT NOT NULL,"
+        " updated_at REAL NOT NULL)"
+    )
+
+
+def save_impact_snapshot(payload):
+    """Persist a computed impact snapshot in the catalog DB (id=1 row)."""
+    conn = get_db()
+    try:
+        _impact_snapshot_init(conn)
+        conn.execute("DELETE FROM impact_snapshot WHERE id=1")
+        conn.execute(
+            "INSERT INTO impact_snapshot (id, payload, updated_at) VALUES (1,?,?)",
+            (json.dumps(payload), time.time()),
+        )
+        conn.commit()
+        cache_del(("impact",))
+    finally:
+        conn.close()
+
+
+def load_impact_snapshot():
+    """Return (payload, updated_epoch) or (None, None) when never computed."""
+    conn = get_db()
+    try:
+        _impact_snapshot_init(conn)
+        row = conn.execute(
+            "SELECT payload, updated_at FROM impact_snapshot WHERE id=1").fetchone()
+        if not row:
+            return None, None
+        try:
+            return json.loads(row["payload"]), row["updated_at"]
+        except Exception:
+            return None, None
+    finally:
+        conn.close()
 
 
 # ── Language & transliteration (per-collection DB) ───────────────────────────
@@ -1527,7 +1704,8 @@ def set_job_resume(job_id, key, value):
         conn.close()
 
 
-def latest_sync_resume(coll_id, job_type, include_noindex=None, sync_version=None):
+def latest_sync_resume(coll_id, job_type, include_noindex=None, sync_version=None,
+                       ia_collection=None):
     """Return resume markers from the most recent failed/interrupted sync of the
     same type, so a freshly queued sync can continue instead of repeating work
     already done.  Returns {'current','resume_cursor','resume_page'} or None.
@@ -1536,7 +1714,11 @@ def latest_sync_resume(coll_id, job_type, include_noindex=None, sync_version=Non
     sync version are honoured — an interrupted run from an older code version
     (e.g. one that did not yet fetch hidden noindex items) fetched a different
     item set, so continuing from its cursor would silently skip items the new
-    version is supposed to cover."""
+    version is supposed to cover.
+
+    ``ia_collection``: when given, only resumes from jobs syncing the same IA
+    (sub-)collection, since a scrape cursor is only valid for the query it was
+    produced from."""
     conn = get_db()
     try:
         if include_noindex is None:
@@ -1562,6 +1744,8 @@ def latest_sync_resume(coll_id, job_type, include_noindex=None, sync_version=Non
                 except Exception:
                     params = {}
             if sync_version is not None and params.get("sync_version") != sync_version:
+                continue
+            if ia_collection != params.get("ia_collection"):
                 continue
             out = {"current": int(row["current"] or 0)}
             if params.get("resume_cursor"):

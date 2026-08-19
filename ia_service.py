@@ -50,16 +50,20 @@ def fetch_collection_items(
     start_page: Optional[int] = None,
     page_callback: Optional[Callable] = None,
     start_count: int = 0,
+    collection_filter: Optional[str] = None,
 ):
     """Fetch ALL items in a collection (full sync, public search API).  Streams
     each item via yield as it is retrieved so the caller can persist records
     incrementally.  Resumable: pass a previously saved ``start_page`` to
     continue where a previous run left off; ``page_callback`` receives the next
-    page number after each page so the caller can persist it."""
+    page number after each page so the caller can persist it.
+
+    ``collection_filter`` overrides the IA collection filter (used to sync just
+    a sub-collection of the stored collection)."""
     if not IA_LIB_AVAILABLE:
         raise RuntimeError("internetarchive library not installed")
 
-    query = f"collection:{collection_identifier}"
+    query = f"collection:{collection_filter or collection_identifier}"
     page  = int(start_page or 1)
     i     = start_count or 0
 
@@ -111,6 +115,7 @@ def fetch_updated_items(
     cursor_callback: Optional[Callable] = None,
     start_count: int = 0,
     include_noindex: bool = False,
+    collection_filter: Optional[str] = None,
 ):
     """
     Smart incremental sync: fetch only items updated on IA after since_date.
@@ -123,19 +128,22 @@ def fetch_updated_items(
     records incrementally (portal updates on the fly).  Resumable: pass a
     previously saved ``start_cursor`` to continue where a previous run left
     off; ``cursor_callback`` is invoked with the next cursor after each page.
-    """
+
+    ``collection_filter`` overrides the IA collection filter (used to sync just
+    a sub-collection of the stored collection)."""
     if not IA_LIB_AVAILABLE:
         raise RuntimeError("internetarchive library not installed")
 
+    coll = collection_filter or collection_identifier
     if since_date:
         # Trim to date portion; IA Lucene expects YYYY-MM-DD and uses * for open end
         date_part = since_date[:10]
         query = (
-            f"collection:{collection_identifier} "
+            f"collection:{coll} "
             f"AND updatedate:[{date_part} TO *]"
         )
     else:
-        query = f"collection:{collection_identifier}"
+        query = f"collection:{coll}"
 
     session = _get_session()
     cursor = start_cursor
@@ -208,6 +216,7 @@ def fetch_collection_all(
     cursor_callback: Optional[Callable] = None,
     start_count: int = 0,
     include_noindex: bool = False,
+    collection_filter: Optional[str] = None,
 ):
     """
     Fetch ALL items in a collection using IA's authenticated scrape API.
@@ -217,7 +226,9 @@ def fetch_collection_all(
     records incrementally (portal updates on the fly).  Resumable: pass a
     previously saved ``start_cursor`` to continue where a previous run left
     off; ``cursor_callback`` is invoked with the next cursor after each page.
-    """
+
+    ``collection_filter`` overrides the IA collection filter (used to sync just
+    a sub-collection of the stored collection)."""
     if not IA_LIB_AVAILABLE:
         raise RuntimeError("internetarchive library not installed")
 
@@ -226,10 +237,11 @@ def fetch_collection_all(
     total  = None
     count  = start_count or 0
     fields_str = ",".join(SEARCH_FIELDS)
+    coll = collection_filter or collection_identifier
 
     while True:
         params = {
-            "q": f"collection:{collection_identifier}",
+            "q": f"collection:{coll}",
             "fields": fields_str,
             "count": 500,
         }
@@ -269,12 +281,14 @@ def fetch_collection_all(
 # with several chains running at once the aggregate is still ~2-3x faster than
 # a single sequential chain.
 
-def _prefix_total(session, collection_identifier, prefix, include_noindex=False):
+def _prefix_total(session, collection_identifier, prefix, include_noindex=False,
+                  collection_filter=None):
     """IA item count for the identifier prefix query (prefix may be empty)."""
+    coll = collection_filter or collection_identifier
     if not prefix:
-        q = f"collection:{collection_identifier}"
+        q = f"collection:{coll}"
     else:
-        q = f"collection:{collection_identifier} AND identifier:{prefix}*"
+        q = f"collection:{coll} AND identifier:{prefix}*"
     params = {"q": q, "fields": "identifier", "count": 100}
     if include_noindex:
         params["scope"] = _SCOPE_ALL
@@ -294,6 +308,7 @@ def fetch_collection_parallel(
     start_count: int = 0,
     prefixes: Optional[list] = None,
     include_noindex: bool = False,
+    collection_filter: Optional[str] = None,
 ):
     """
     Fetch ALL items in a collection using the authenticated scrape API,
@@ -312,7 +327,11 @@ def fetch_collection_parallel(
     Resumable: ``start_state`` maps bucket index -> cursor (a bucket is skipped
     when its cursor is None).  ``state_callback`` is called with the full state
     dict after each page so the caller can persist it for restart.
-    """
+
+    ``collection_filter`` overrides the IA collection filter (used to sync just
+    a sub-collection of the stored collection; the prefix split over the stored
+    collection still partitions the sub-collection, since the latter's items
+    live inside the former's identifier space)."""
     if not IA_LIB_AVAILABLE:
         raise RuntimeError("internetarchive library not installed")
 
@@ -337,11 +356,13 @@ def fetch_collection_parallel(
             cursor_callback=state_callback
             and (lambda c: state_callback({"first": c})),
             start_count=start_count,
-            include_noindex=include_noindex)
+            include_noindex=include_noindex,
+            collection_filter=collection_filter)
         return
 
     total = _prefix_total(session, collection_identifier, "",
-                          include_noindex=include_noindex) or 0
+                          include_noindex=include_noindex,
+                          collection_filter=collection_filter) or 0
 
     def _bucket_key(idx):
         return f"b{idx}"
@@ -360,8 +381,9 @@ def fetch_collection_parallel(
             return  # bucket finished in a previous run
         if cursor is _PENDING:
             cursor = None  # fresh start
-        query = (f"collection:{collection_identifier} AND identifier:{prefix}*"
-                 if prefix else f"collection:{collection_identifier}")
+        query = (f"collection:{collection_filter or collection_identifier} "
+                 f"AND identifier:{prefix}*"
+                 if prefix else f"collection:{collection_filter or collection_identifier}")
         try:
             while not stop.is_set():
                 params = {"q": query, "fields": fields_str, "count": 500}
@@ -585,6 +607,64 @@ def fetch_item_stats(identifiers) -> dict:
                 "have_data":  bool(stats.get("have_data")),
             }
     return results
+
+
+_SESSION = None
+_SESSION_LOCK = threading.Lock()
+
+
+def _http():
+    global _SESSION
+    import requests
+    if _SESSION is None:
+        with _SESSION_LOCK:
+            if _SESSION is None:
+                s = requests.Session()
+                a = requests.adapters.HTTPAdapter(pool_connections=8,
+                                                  pool_maxsize=8, max_retries=2)
+                s.mount("https://", a)
+                _SESSION = s
+    return _SESSION
+
+
+def fetch_item_page_count(identifier) -> int:
+    """Fetch an item's page count from the IA Metadata API.
+    Fast path: a top-level ``imagecount`` field.  Fallback: parse the item's
+    ``*_scandata.xml`` for the number of <pageData> entries (covers JaiGyan-era
+    scans that expose no imagecount).  Returns 0 when no page data exists.
+    Raises RuntimeError on transport/API failure."""
+    import xml.etree.ElementTree as ET
+    url = f"https://archive.org/metadata/{identifier}"
+    last_err = None
+    for attempt in range(3):
+        try:
+            resp = _http().get(url, timeout=60)
+            resp.raise_for_status()
+            j = resp.json()
+            meta = j.get("metadata") or {}
+            for field in ("imagecount", "item_count", "no_of_pages"):
+                try:
+                    val = int(meta.get(field) or 0)
+                except (TypeError, ValueError):
+                    val = 0
+                if val > 0:
+                    return val
+            scandata = next((f.get("name") for f in (j.get("files") or [])
+                             if f.get("name", "").endswith("_scandata.xml")), None)
+            if not scandata:
+                return 0
+            sr = _http().get(f"https://archive.org/download/{identifier}/{scandata}",
+                             timeout=60)
+            sr.raise_for_status()
+            root = ET.fromstring(sr.content)
+            count = 0
+            for pd in root.iter("pageData"):
+                count += 1
+            return count
+        except Exception as e:
+            last_err = e
+            time.sleep(1.5 * (attempt + 1))
+    raise RuntimeError(f"Metadata API error for {identifier}: {last_err}")
 
 
 def check_ia_cli() -> dict:

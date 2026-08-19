@@ -435,6 +435,9 @@ th.sorted .th-sort{opacity:1;}
     <span class="dot" id="diag-health-dot"></span>
     <span id="diag-health-label">Status</span>
   </button>
+  <button class="diag-btn" onclick="showView('view-impact')" title="Impact stats across all collections" id="impact-topbar-btn" style="margin-left:8px">
+    <span>Impact</span>
+  </button>
   <button class="diag-btn" onclick="toggleOps()" title="Operations &amp; Sync: job queue and per-collection databases" id="ops-topbar-btn" style="margin-left:8px">
     <span class="dot" id="ops-dot" style="background:var(--text3)"></span>
     <span>Ops</span>
@@ -745,6 +748,44 @@ th.sorted .th-sort{opacity:1;}
     </div>
 
   </div><!-- /#view-items -->
+
+  <!-- Impact Stats view -->
+  <div class="view" id="view-impact">
+    <div class="impact-wrap" style="padding:24px;max-width:1200px;margin:0 auto;width:100%;">
+
+      <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:18px;">
+        <h2 style="font-size:22px;font-weight:700;margin:0;color:var(--text1);">Impact Stats</h2>
+        <span style="font-size:12px;color:var(--text3);">Aggregate reach of every stored collection</span>${staleBadge}
+        <span class="topbar-sep"></span>
+        <button class="btn btn-ghost btn-sm" id="impact-refresh" onclick="loadImpactStats()">⟳ Refresh</button>
+      </div>
+
+      <div id="impact-summary" style="display:flex;gap:12px;flex-wrap:wrap;margin-bottom:20px;">
+        <div class="impact-loading" style="color:var(--text3);font-size:13px;">Loading impact stats…</div>
+      </div>
+
+      <div style="font-weight:600;margin:18px 0 10px;color:var(--text2);font-size:14px;">Top Languages</div>
+      <div id="impact-languages" style="display:flex;flex-direction:column;gap:8px;margin-bottom:22px;">
+        <div class="impact-loading" style="color:var(--text3);font-size:13px;">—</div>
+      </div>
+
+      <div style="font-weight:600;margin:18px 0 10px;color:var(--text2);font-size:14px;">Most Downloaded</div>
+      <div id="impact-top-downloads" style="margin-bottom:22px;">
+        <div class="impact-loading" style="color:var(--text3);font-size:13px;">—</div>
+      </div>
+
+      <div style="font-weight:600;margin:18px 0 10px;color:var(--text2);font-size:14px;">Most Viewed (30d)</div>
+      <div id="impact-top-views" style="margin-bottom:22px;">
+        <div class="impact-loading" style="color:var(--text3);font-size:13px;">—</div>
+      </div>
+
+      <div style="font-weight:600;margin:18px 0 10px;color:var(--text2);font-size:14px;">Per-Collection Breakdown</div>
+      <div id="impact-collections" style="overflow-x:auto;border:1px solid var(--border);border-radius:8px;background:var(--bg2);">
+        <div class="impact-loading" style="color:var(--text3);font-size:13px;padding:12px;">—</div>
+      </div>
+
+    </div>
+  </div>
 
 </main>
 </div>
@@ -1224,14 +1265,16 @@ async function deleteCollection(id) {
 // ══════════════════════════════════════════════════════════
 async function syncSmart() {
   if (!S.activeColl) return;
+  const scopeLabel = S.activeIaColl ? ` (${S.activeIaCollName||S.activeIaColl})` : '';
   // If collection has never been synced, a full sync is needed first
   if (!S.activeColl.last_synced) {
     toast('No prior sync found — starting a full sync instead…','info');
     return syncFull(true);
   }
-  const r = await api(`/api/collections/${S.activeColl.id}/smart-sync`,'POST');
+  const r = await api(`/api/collections/${S.activeColl.id}/smart-sync`,'POST',
+                      {ia_collection: S.activeIaColl || null});
   if (!r.ok) { toast(r.error,'error'); return; }
-  toast('⚡ Smart sync queued — items changed since ' + S.activeColl.last_synced.slice(0,10) + '…','info');
+  toast('⚡ Smart sync queued' + scopeLabel + ' — items changed since ' + S.activeColl.last_synced.slice(0,10) + '…','info');
   trackJob(r.data.job_id);
   startSyncPoll();
   startLiveNumbers();
@@ -1239,10 +1282,12 @@ async function syncSmart() {
 
 async function syncFull(includeNoindex=false) {
   if (!S.activeColl) return;
-  const r = await api(`/api/collections/${S.activeColl.id}/sync`,'POST',{include_noindex: includeNoindex});
+  const scopeLabel = S.activeIaColl ? ` (${S.activeIaCollName||S.activeIaColl})` : '';
+  const r = await api(`/api/collections/${S.activeColl.id}/sync`,'POST',
+                      {include_noindex: includeNoindex, ia_collection: S.activeIaColl || null});
   if (!r.ok) { toast(r.error,'error'); return; }
-  const label = includeNoindex ? '🔒 Full sync (incl. hidden items) queued…' : '⟳ Full sync queued…';
-  toast(label,'info');
+  const label = includeNoindex ? '🔒 Full sync (incl. hidden)' : '⟳ Full sync';
+  toast(label + scopeLabel + ' queued…','info');
   trackJob(r.data.job_id);
   startSyncPoll();
   startLiveNumbers();
@@ -2159,6 +2204,7 @@ function showView(id) {
   document.getElementById(id).classList.add('active');
   closeDetail();
   if (id === 'view-welcome') loadHomeStats();
+  if (id === 'view-impact') loadImpactStats();
 }
 
 // ── Home dashboard stats ───────────────────────────────────────────────────────
@@ -2237,6 +2283,114 @@ async function loadHomeStats() {
   subEl.innerHTML = gridHtml;
 }
 
+// ── Impact stats view ─────────────────────────────────────────────────────────
+async function loadImpactStats() {
+  const r = await api('/api/stats/impact');
+  const el = document.getElementById('impact-summary');
+  if (!r.ok || !el) return;
+  const needsCompute = !r.data || !r.data.snapshot;
+  if (needsCompute) {
+    const note = '<div style="color:var(--text3);font-size:13px;">Computing impact stats (first pass scans the full database and can take ~30s)…</div>';
+    el.innerHTML = note;
+    document.getElementById('impact-languages').innerHTML = note;
+    document.getElementById('impact-top-downloads').innerHTML = note;
+    document.getElementById('impact-top-views').innerHTML = note;
+    document.getElementById('impact-collections').innerHTML = note;
+    setTimeout(() => loadImpactStats(), 5000);
+    return;
+  }
+  const staleBadge = r.data.stale
+    ? '<span style="font-size:11px;color:var(--amber);margin-left:4px;" title="Numbers reflect the last computed snapshot">· stale — refreshing…</span>' : '';
+  const s = r.data.snapshot;
+  const f = n => (n||0).toLocaleString();
+
+  el.innerHTML = [
+    ['📚','Items',f(s.items)],
+    ['📄','Pages',f(s.pages)],
+    ['🌐','Languages',f(s.languages)],
+    ['⬇','Downloads',f(s.downloads)],
+    ['👁','Views (30d)',f(s.views_30d)],
+    ['🗂','Collections',f(s.collections)],
+  ].map(([ic,label,val]) => `
+    <div style="flex:1;min-width:150px;background:var(--bg2);border:1px solid var(--border);border-radius:10px;padding:14px 16px;">
+      <div style="font-size:12px;color:var(--text3);">${ic} ${label}</div>
+      <div style="font-size:24px;font-weight:700;color:var(--text1);margin-top:4px;">${val}</div>
+      ${label==='Pages' && s.pages_items ? `<div style="font-size:11px;color:var(--text3);margin-top:2px;">${f(s.pages_items)} items with page counts</div>` : ''}
+    </div>`).join('')
+    + `<div style="flex:1;min-width:150px;background:var(--bg2);border:1px solid var(--border);border-radius:10px;padding:14px 16px;">
+        <div style="font-size:12px;color:var(--text3);">🚧 Pipeline</div>
+        <div style="font-size:24px;font-weight:700;color:var(--text1);margin-top:4px;">${f(s.modified)}</div>
+        <div style="font-size:11px;color:var(--text3);margin-top:2px;">modified · ${f(s.pushed)} pushed · ${f(s.pending_push)} pending</div>
+       </div>`;
+
+  document.getElementById('impact-languages').innerHTML = s.top_languages.length
+    ? s.top_languages.map(([lang,cnt]) => {
+        const pct = Math.round(cnt/s.items*1000)/10;
+        return `<div style="display:flex;align-items:center;gap:10px;">
+          <span style="width:160px;font-size:12px;color:var(--text2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;" title="${esc(lang)}">${esc(lang)}</span>
+          <div style="flex:1;height:10px;background:var(--bg3);border-radius:5px;overflow:hidden;">
+            <div style="height:100%;width:${pct}%;background:linear-gradient(90deg,#d4a017,#e8c356);"></div>
+          </div>
+          <span style="width:130px;text-align:right;font-size:12px;color:var(--text2);">${cnt.toLocaleString()} · ${pct}%</span>
+        </div>`; }).join('')
+    : '<span style="color:var(--text3);font-size:13px;">No language data yet.</span>';
+
+  const rows = list => (list||[]).map(t => `
+    <tr>
+      <td style="padding:6px 10px;font-size:12px;color:var(--text2);max-width:340px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;"><a href="https://archive.org/details/${esc(t.identifier)}" target="_blank" style="color:var(--gold);">${esc(t.title||t.identifier)}</a></td>
+      <td style="padding:6px 10px;font-size:12px;color:var(--text3);">${esc(t.lang||'—')}</td>
+      <td style="padding:6px 10px;font-size:12px;color:var(--text2);text-align:right;">${f(t.downloads)} dl</td>
+      <td style="padding:6px 10px;font-size:12px;color:var(--text2);text-align:right;">${f(t.views_30d)} views</td>
+      <td style="padding:6px 10px;font-size:12px;color:var(--text3);text-align:right;">${t.imagecount ? f(t.imagecount)+' pg' : '—'}</td>
+    </tr>`).join('');
+
+  document.getElementById('impact-top-downloads').innerHTML = s.top_downloads.length
+    ? `<table style="width:100%;border-collapse:collapse;"><tbody>${rows(s.top_downloads)}</tbody></table>`
+    : '<span style="color:var(--text3);font-size:13px;">No download data yet — run a “Fetch Stats” job.</span>';
+  document.getElementById('impact-top-views').innerHTML = s.top_views.length
+    ? `<table style="width:100%;border-collapse:collapse;"><tbody>${rows(s.top_views)}</tbody></table>`
+    : '<span style="color:var(--text3);font-size:13px;">No view data yet — run a “Fetch Stats” job.</span>';
+
+  document.getElementById('impact-collections').innerHTML = `
+    <table style="width:100%;border-collapse:collapse;min-width:780px;">
+      <thead><tr style="background:var(--bg3);color:var(--text2);font-size:11px;text-transform:uppercase;letter-spacing:.05em;">
+        <th style="padding:8px 10px;text-align:left;">Collection</th>
+        <th style="padding:8px 10px;text-align:right;">Items</th>
+        <th style="padding:8px 10px;text-align:right;">Pages</th>
+        <th style="padding:8px 10px;text-align:right;">Languages</th>
+        <th style="padding:8px 10px;text-align:right;">Downloads</th>
+        <th style="padding:8px 10px;text-align:right;">Views 30d</th>
+        <th style="padding:8px 10px;text-align:right;">Modified</th>
+        <th style="padding:8px 10px;text-align:right;">Pushed</th>
+        <th style="padding:8px 10px;text-align:right;"></th>
+      </tr></thead>
+      <tbody>
+        ${s.per_collection.map(c => `
+          <tr style="border-top:1px solid var(--border);">
+            <td style="padding:7px 10px;font-size:13px;color:var(--text1);">${esc(c.name||c.identifier)}</td>
+            <td style="padding:7px 10px;text-align:right;font-size:13px;color:var(--text2);">${f(c.items)}</td>
+            <td style="padding:7px 10px;text-align:right;font-size:13px;color:var(--text2);">${f(c.pages)}<div style="font-size:10px;color:var(--text3);">${c.pages_items ? f(c.pages_items)+' items' : 'no counts'}</div></td>
+            <td style="padding:7px 10px;text-align:right;font-size:13px;color:var(--text2);">${c.languages}</td>
+            <td style="padding:7px 10px;text-align:right;font-size:13px;color:var(--text2);">${f(c.downloads)}</td>
+            <td style="padding:7px 10px;text-align:right;font-size:13px;color:var(--text2);">${f(c.views_30d)}</td>
+            <td style="padding:7px 10px;text-align:right;font-size:13px;color:var(--text2);">${f(c.modified)}</td>
+            <td style="padding:7px 10px;text-align:right;font-size:13px;color:var(--text2);">${f(c.pushed)}</td>
+            <td style="padding:7px 10px;text-align:right;"><button class="btn btn-ghost btn-sm" onclick="startFetchPages(${c.id})" title="Backfill page counts (imagecount) for this collection">+ Pages</button></td>
+          </tr>`).join('')}
+      </tbody>
+    </table>`;
+  if (r.data.stale) setTimeout(() => loadImpactStats(), 15000);
+}
+
+async function startFetchPages(collId) {
+  const r = await api(`/api/collections/${collId}/fetch-pages`, {method:'POST'});
+  if (r.ok) {
+    alert('Page-count backfill queued (job #'+r.data.job_id+'). It runs in the background.');
+    loadImpactStats();
+  } else {
+    alert(r.error || 'Failed to queue page-count job');
+  }
+}
 function _relTime(iso) {
   const d = new Date(iso.replace(' ','T')+'Z');
   if (isNaN(d)) return iso;

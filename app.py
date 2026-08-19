@@ -7,6 +7,7 @@ v3: persistent background job queue, per-collection sharded databases,
     and disk-cached collection logos.
 """
 import csv, io, json, os, re, threading, time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from flask import Flask, jsonify, request, render_template, send_file, Response
 
@@ -87,6 +88,35 @@ def start_job_worker():
     for i in range(WORKER_THREADS):
         threading.Thread(target=_worker_loop, daemon=True,
                          name=f"job-worker-{i+1}").start()
+    threading.Thread(target=_impact_refresher, daemon=True,
+                     name="impact-refresher").start()
+
+
+# ── Impact snapshot refresher ──────────────────────────────────────────────────
+IMPACT_TTL = 300
+_impact_evt = threading.Event()
+
+
+def _kick_impact_refresh():
+    _impact_evt.set()
+
+
+def _impact_refresher():
+    """Keep the persisted impact snapshot within IMPACT_TTL of the data by
+    recomputing in the background.  The full scan of large SQLite stores can
+    take tens of seconds, so this never runs on the request path."""
+    while True:
+        try:
+            payload, updated = db.load_impact_snapshot()
+            valid = payload is not None and payload.get("collections", 0) > 0
+            fresh = valid and updated is not None \
+                and (time.time() - updated) < IMPACT_TTL
+            if not fresh:
+                db.save_impact_snapshot(db.get_impact_stats())
+        except Exception as e:
+            print(f"[impact-refresher] error: {e}", flush=True)
+        _impact_evt.clear()
+        _impact_evt.wait(timeout=IMPACT_TTL)
 
 
 def _worker_loop():
@@ -133,6 +163,8 @@ def _dispatch_job(job):
         _run_bulk_collection(job_id, coll_id, params)
     elif jt == "fetch-stats":
         _run_fetch_stats(job_id, coll_id, params)
+    elif jt == "fetch-pages":
+        _run_fetch_pages(job_id, coll_id, params)
     elif jt == "copy-alt":
         _run_copy_alt(job_id, coll_id, params)
     elif jt == "translit-generate":
@@ -143,6 +175,9 @@ def _dispatch_job(job):
         _run_vacuum(job_id, coll_id, params)
     else:
         raise ValueError(f"Unknown job type: {jt}")
+    if jt in ("full-sync", "smart-sync", "push-all", "bulk-collection",
+              "fetch-stats", "fetch-pages"):
+        _kick_impact_refresh()
 
 
 def _job_state(job):
@@ -186,6 +221,7 @@ def _run_sync(job_id, coll_id, params, smart=False):
         db.fail_job(job_id, "Collection no longer exists")
         return
     include_noindex = bool(params.get("include_noindex"))
+    ia_collection   = params.get("ia_collection") or None  # sub-collection filter, if any
     mode = "smart" if smart else ("full-noindex" if include_noindex else "full")
     job_row = db.get_job(job_id) or {}
     # Stamp the sync version on this job so a future interrupted run only
@@ -233,19 +269,20 @@ def _run_sync(job_id, coll_id, params, smart=False):
 
     try:
         db.add_job_log(job_id, "info",
-                       f"Fetching from IA collection '{coll['identifier']}'"
+                       f"Fetching from IA collection '{ia_collection or coll['identifier']}'"
                        + (" (resuming from saved position)" if resuming else ""))
         if smart:
             items = ia_svc.fetch_updated_items(
                 coll["identifier"], params.get("since") or coll.get("last_synced"),
                 progress, start_cursor=resume_cursor, cursor_callback=save_cursor,
-                start_count=start_count, include_noindex=include_noindex)
+                start_count=start_count, include_noindex=include_noindex,
+                collection_filter=ia_collection)
         elif include_noindex:
             if resuming:
                 items = ia_svc.fetch_collection_all(
                     coll["identifier"], progress, start_cursor=resume_cursor,
                     cursor_callback=save_cursor, start_count=start_count,
-                    include_noindex=include_noindex)
+                    include_noindex=include_noindex, collection_filter=ia_collection)
             else:
                 # Fresh full sync: split the identifier space into prefix
                 # buckets (from the local item distribution) and run one
@@ -262,11 +299,13 @@ def _run_sync(job_id, coll_id, params, smart=False):
                     start_state={"first": resume_cursor} if resume_cursor else None,
                     prefixes=prefixes or None,
                     start_count=start_count,
-                    include_noindex=include_noindex)
+                    include_noindex=include_noindex,
+                    collection_filter=ia_collection)
         else:
             items = ia_svc.fetch_collection_items(
                 coll["identifier"], progress, start_page=resume_page,
-                page_callback=save_page, start_count=start_count)
+                page_callback=save_page, start_count=start_count,
+                collection_filter=ia_collection)
 
         # Stream: persist each item in batches as it arrives so the portal
         # updates live.  Batching turns ~1.8M per-item DB connections into a
@@ -448,6 +487,60 @@ def _run_fetch_stats(job_id, coll_id, params):
         db.update_job_progress(job_id, done, total)
         time.sleep(0.05)
 
+
+def _run_fetch_pages(job_id, coll_id, params):
+    """Backfill page counts (imagecount) for every item in a collection by
+    querying the IA Metadata API per item (resumable via last_id/done)."""
+    coll = db.get_collection(coll_id)
+    if not coll:
+        db.fail_job(job_id, "Collection no longer exists")
+        return
+    job = db.get_job(job_id) or {}
+    jparams = job.get("params") or {}
+    if isinstance(jparams, str):
+        try:
+            jparams = json.loads(jparams)
+        except Exception:
+            jparams = {}
+
+    total = jparams.get("total")
+    if total is None:
+        total = db.get_stats(coll_id).get("total") or 0
+        db.set_job_resume(job_id, "total", total)
+
+    after_id = jparams.get("last_id")
+    done = int(jparams.get("done") or 0)
+    db.update_job_progress(job_id, done, total)
+    db.add_job_log(job_id, "info",
+                   f"Fetching page counts for {total} item(s)"
+                   + (", resuming from item " + str(after_id) if after_id else ""))
+
+    while True:
+        if db.job_cancel_requested(job_id):
+            db.finish_job(job_id, "cancelled")
+            return
+        batch = db.get_item_identifiers(coll_id, after_id=after_id, limit=40)
+        if not batch:
+            break
+        counts = {}
+        with ThreadPoolExecutor(max_workers=4) as ex:
+            futures = {ex.submit(ia_svc.fetch_item_page_count, it["identifier"]): it
+                       for it in batch}
+            for fut in as_completed(futures, timeout=180):
+                it = futures[fut]
+                try:
+                    counts[it["identifier"]] = fut.result()
+                except Exception as e:
+                    db.add_job_log(job_id, "warn", f"{it['identifier']}: {e}")
+        if counts:
+            db.update_item_imagecount_batch(coll_id, counts)
+        after_id = batch[-1]["id"]
+        done += len(batch)
+        db.set_job_resume(job_id, "last_id", after_id)
+        db.set_job_resume(job_id, "done", done)
+        db.update_job_progress(job_id, done, total)
+        time.sleep(0.05)
+
     db.finish_job(job_id, "done", new_count=done)
     db.add_job_log(job_id, "info", f"Updated views/downloads for {done} item(s)")
 
@@ -576,6 +669,34 @@ def api_collection_stats(coll_id):
     return ok(db.get_stats(coll_id, ia_coll))
 
 
+@app.route("/api/stats/impact")
+def api_stats_impact():
+    """Aggregate impact metrics across all stored collections.
+
+    The heavy aggregate is computed in the background and persisted as a
+    snapshot; this endpoint serves the snapshot (fast) with a staleness flag."""
+    payload, updated = db.load_impact_snapshot()
+    empty = payload is None or not payload.get("collections")
+    stale = empty or updated is None or (time.time() - updated) > 300
+    out = {"snapshot": payload, "updated_at": updated, "stale": stale}
+    if payload is None:
+        _kick_impact_refresh()
+    return ok(out)
+
+
+@app.route("/api/collections/<int:coll_id>/fetch-pages", methods=["POST"])
+def api_fetch_pages(coll_id):
+    """Queue a background job to backfill page counts (imagecount) for every
+    item in the collection via the IA Metadata API."""
+    coll = db.get_collection(coll_id)
+    if not coll:
+        return err("Collection not found", 404)
+    db.cancel_queued_syncs(coll_id, "fetch-pages")
+    job_id = db.create_job("fetch-pages", coll_id, {},
+                           title=f"Fetch pages · {coll['name']}")
+    return ok({"job_id": job_id}), 202
+
+
 # ── Sync & background jobs ────────────────────────────────────────────────────
 
 @app.route("/api/collections/<int:coll_id>/discover-subs", methods=["POST"])
@@ -594,27 +715,33 @@ def api_sync_collection(coll_id):
     """
     Queue a full sync.  Pass JSON body {"include_noindex": true} to use the
     authenticated scrape API (fetches hidden items the account has access to).
+    Pass {"ia_collection": "in.ernet.dli"} to sync just that IA sub-collection
+    instead of the whole stored collection.
     """
     coll = db.get_collection(coll_id)
     if not coll:
         return err("Collection not found", 404)
     body = request.get_json(silent=True) or {}
     include_noindex = bool(body.get("include_noindex", False))
+    ia_collection   = (body.get("ia_collection") or "").strip() or None
     mode = "full-noindex" if include_noindex else "full"
     # Only one pending full sync per collection: supersede older queued ones
     db.cancel_queued_syncs(coll_id, "full-sync")
     params = {"include_noindex": include_noindex}
+    if ia_collection:
+        params["ia_collection"] = ia_collection
     # Resume from the most recent failed sync of the same type if available
     resume = db.latest_sync_resume(coll_id, "full-sync", include_noindex=include_noindex,
-                                   sync_version=SYNC_VERSION)
+                                   sync_version=SYNC_VERSION, ia_collection=ia_collection)
     if resume:
         for k in ("resume_cursor", "resume_page"):
             if k in resume:
                 params[k] = resume[k]
         params["resume_current"] = resume.get("current", 0)
+    target = ia_collection or coll["name"]
     job_id = db.create_job(
         "full-sync", coll_id, params,
-        title=f"Full sync · {coll['name']} · {'incl. hidden' if include_noindex else 'public'}",
+        title=f"Full sync · {target} · {'incl. hidden' if include_noindex else 'public'}",
     )
     _sync_state[coll_id] = {"status": "queued", "current": 0, "total": 0,
                             "new_count": 0, "error": None, "mode": mode, "job_id": job_id}
@@ -627,26 +754,32 @@ def api_sync_collection(coll_id):
 def api_smart_sync(coll_id):
     """
     Queue a smart sync — fetch only items changed on IA since the collection's
-    last_synced date.  Pass {"include_noindex": true} for hidden items too.
+    last_synced date.  Pass {"include_noindex": true} for hidden items too, and
+    {"ia_collection": "in.ernet.dli"} to sync just that IA sub-collection.
     """
     coll = db.get_collection(coll_id)
     if not coll:
         return err("Collection not found", 404)
     body  = request.get_json(silent=True) or {}
     since = body.get("since") or coll.get("last_synced")
+    ia_collection = (body.get("ia_collection") or "").strip() or None
     # Only one pending smart sync per collection: supersede older queued ones
     db.cancel_queued_syncs(coll_id, "smart-sync")
     params = {"since": since, "include_noindex": body.get("include_noindex", False)}
+    if ia_collection:
+        params["ia_collection"] = ia_collection
     # Resume from the most recent failed sync of the same type if available
-    resume = db.latest_sync_resume(coll_id, "smart-sync", sync_version=SYNC_VERSION)
+    resume = db.latest_sync_resume(coll_id, "smart-sync", sync_version=SYNC_VERSION,
+                                   ia_collection=ia_collection)
     if resume:
         for k in ("resume_cursor", "resume_page"):
             if k in resume:
                 params[k] = resume[k]
         params["resume_current"] = resume.get("current", 0)
+    target = ia_collection or coll["name"]
     job_id = db.create_job(
         "smart-sync", coll_id, params,
-        title=f"Smart sync · {coll['name']}",
+        title=f"Smart sync · {target}",
     )
     _sync_state[coll_id] = {"status": "queued", "current": 0, "total": 0,
                             "new_count": 0, "error": None, "mode": "smart",
