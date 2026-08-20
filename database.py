@@ -35,13 +35,27 @@ ID_OFFSET     = 100_000_000   # max items per collection before ids collide
 
 # ── Catalog connection (collections / jobs / sub-collections / meta) ─────────
 
+def _conn_pragmas(conn, big=False):
+    """Tune a fresh SQLite connection for this workload.
+
+    WAL keeps readers from blocking writers; a bigger page cache and an mmap
+    window turn repeated scans of the multi-GB collection files into page-cache
+    hits instead of disk reads; ``synchronous=NORMAL`` (safe under WAL) and an
+    in-memory temp store cut write and sort overhead."""
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=" + ("60000" if big else "30000"))
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("PRAGMA cache_size=" + ("-65536" if big else "-16384"))
+    conn.execute("PRAGMA mmap_size=" + ("2147483648" if big else "268435456"))
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA temp_store=MEMORY")
+
+
 def get_db():
     """Open the catalog DB (collections, jobs, sub-collections, meta)."""
     conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA busy_timeout=30000")
-    conn.execute("PRAGMA foreign_keys=ON")
+    _conn_pragmas(conn, big=False)
     return conn
 
 
@@ -325,10 +339,16 @@ CREATE TABLE IF NOT EXISTS review_batches (
     status        TEXT    DEFAULT 'exported'
 );
 
+CREATE TABLE IF NOT EXISTS coll_flags (
+    key   TEXT PRIMARY KEY,
+    value TEXT
+);
+
 CREATE INDEX IF NOT EXISTS idx_items_identifier   ON items(identifier);
 CREATE INDEX IF NOT EXISTS idx_items_modified     ON items(is_modified);
 CREATE INDEX IF NOT EXISTS idx_items_pushed       ON items(is_pushed);
 CREATE INDEX IF NOT EXISTS idx_items_lang         ON items(detected_language);
+CREATE INDEX IF NOT EXISTS idx_items_lang_status  ON items(detected_language, translit_status);
 CREATE INDEX IF NOT EXISTS idx_items_tstatus      ON items(translit_status);
 CREATE INDEX IF NOT EXISTS idx_items_title        ON items(title);
 CREATE INDEX IF NOT EXISTS idx_items_creator      ON items(creator);
@@ -338,6 +358,8 @@ CREATE INDEX IF NOT EXISTS idx_items_date         ON items(date);
 CREATE INDEX IF NOT EXISTS idx_items_year         ON items(year);
 CREATE INDEX IF NOT EXISTS idx_items_last_synced  ON items(last_synced);
 CREATE INDEX IF NOT EXISTS idx_items_last_modified ON items(last_modified);
+CREATE INDEX IF NOT EXISTS idx_items_downloads   ON items(downloads);
+CREATE INDEX IF NOT EXISTS idx_items_views_30d   ON items(views_30d);
 CREATE INDEX IF NOT EXISTS idx_ic_collection      ON item_collections(collection);
 CREATE INDEX IF NOT EXISTS idx_ic_coll_item       ON item_collections(collection, item_id);
 """
@@ -390,9 +412,7 @@ def get_coll_db_conn(identifier):
     # instead of failing with "database is locked".
     conn = sqlite3.connect(_coll_path(identifier), timeout=60)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA busy_timeout=60000")
-    conn.execute("PRAGMA foreign_keys=ON")
+    _conn_pragmas(conn, big=True)
     _init_coll_conn(conn, identifier)
     return conn
 
@@ -485,6 +505,10 @@ def _fts_rebuild_conn(conn):
         "INSERT INTO items_fts (rowid, " + cols + ") "
         "VALUES (?," + ",".join("?" * len(_FTS_COLS)) + ")",
         [tuple(r) for r in rows],
+    )
+    conn.execute(
+        "INSERT OR REPLACE INTO coll_flags (key, value) VALUES ('fts_count', ?)",
+        (str(len(rows)),),
     )
     conn.commit()
     return len(rows)
@@ -747,9 +771,11 @@ def _sub_local_count(coll_id, ia_coll):
         return cached
     conn = get_coll_db(coll_id)
     try:
+        # item_collections is FK-cascaded and UNIQUE(item_id, collection), so
+        # COUNT(*) == COUNT(DISTINCT item_id). A plain covering-index scan is
+        # ~100x cheaper than joining every membership row back to items.
         n = conn.execute(
-            """SELECT COUNT(DISTINCT ic.item_id) FROM item_collections ic
-               JOIN items it ON it.id = ic.item_id WHERE ic.collection = ?""",
+            "SELECT COUNT(*) FROM item_collections WHERE collection=?",
             (ia_coll,),
         ).fetchone()[0]
     finally:
@@ -771,6 +797,12 @@ def _fts_upsert(conn, item_id, metadata_dict):
     if not fts_supported():
         return
     try:
+        # Track the FTS row count cheaply so fts_status() doesn't need a 20s+
+        # COUNT(*) over the virtual table. A row that already exists is a
+        # delete-then-reinsert (count unchanged); a fresh one adds a row.
+        had = conn.execute(
+            "SELECT 1 FROM items_fts WHERE rowid=?", (item_id,)
+        ).fetchone()
         conn.execute("DELETE FROM items_fts WHERE rowid=?", (item_id,))
         vals = [metadata_dict.get(col) for col in _FTS_COLS]
         conn.execute(
@@ -778,6 +810,11 @@ def _fts_upsert(conn, item_id, metadata_dict):
             "VALUES (?," + ",".join("?" * len(_FTS_COLS)) + ")",
             [item_id] + vals,
         )
+        if not had:
+            conn.execute(
+                "UPDATE coll_flags SET value=CAST(value AS INTEGER)+1 "
+                "WHERE key='fts_count'"
+            )
     except Exception:
         try:
             conn.execute("DELETE FROM items_fts WHERE rowid=?", (item_id,))
@@ -1079,14 +1116,26 @@ def list_items(collection_id, search=None, modified_only=False,
     if translit_status:
         where.append("i.translit_status=?")
         params.append(translit_status)
+    allowed = {"title", "identifier", "creator", "author", "publisher",
+               "date", "year", "last_modified", "last_synced",
+               "detected_language", "rank", "relevance"}
+    if sort not in allowed:
+        sort = "title"
+    relevance = sort in ("rank", "relevance")
+    direction = "DESC" if sort_dir.lower() == "desc" else "ASC"
+    offset = (page - 1) * per_page
+
     fts_match = None
     if search:
         pos_expr, neg_exprs = _fts_query(search)
         if fts_supported() and (pos_expr or neg_exprs):
             if pos_expr:
                 fts_match = pos_expr
-                where.append("i.id IN (SELECT rowid FROM items_fts WHERE items_fts MATCH ?)")
-                params.append(pos_expr)
+                if not relevance:
+                    # The relevance path joins ft below instead of filtering
+                    # here, so a single FTS evaluation drives order + total.
+                    where.append("i.id IN (SELECT rowid FROM items_fts WHERE items_fts MATCH ?)")
+                    params.append(pos_expr)
             for ng in neg_exprs:
                 where.append("i.id NOT IN (SELECT rowid FROM items_fts WHERE items_fts MATCH ?)")
                 params.append(ng)
@@ -1100,48 +1149,60 @@ def list_items(collection_id, search=None, modified_only=False,
 
     where_sql = " AND ".join(where) if where else "1=1"
 
-    allowed = {"title", "identifier", "creator", "author", "publisher",
-               "date", "year", "last_modified", "last_synced",
-               "detected_language", "rank", "relevance"}
-    if sort not in allowed:
-        sort = "title"
-    relevance = sort in ("rank", "relevance")
-    direction = "DESC" if sort_dir.lower() == "desc" else "ASC"
-    offset = (page - 1) * per_page
-
-    total = conn.execute(
-        f"SELECT COUNT(*) FROM items i WHERE {where_sql}", params
-    ).fetchone()[0]
-
-    ft_join = ""
     if relevance and fts_match:
-        # Join the FTS5 matched set so the bm25 ``rank`` column (lower = better)
-        # drives the ordering; this lives in FROM so its placeholder binds first.
-        ft_join = ("JOIN (SELECT rowid AS rid, rank AS ft_rank FROM items_fts "
-                   "WHERE items_fts MATCH ?) ft ON ft.rid=i.id")
-        order_expr = "ft.ft_rank ASC"
-        sel_params = [fts_match] + params + [per_page, offset]
+        # One FTS evaluation: a CTE join drives the bm25 ordering and a window
+        # COUNT(*) OVER () reports the filtered total without re-running the
+        # MATCH.  When the requested page falls past the end, the windowed
+        # result is empty and the count falls back to a cheap IN-subquery.
+        rows = conn.execute(
+            f"""WITH ft AS (SELECT rowid AS rid, rank AS ft_rank
+                            FROM items_fts WHERE items_fts MATCH ?)
+                SELECT i.*,
+                       (SELECT GROUP_CONCAT(collection,'||') FROM item_collections ic
+                        WHERE ic.item_id = i.id) AS collections,
+                       COUNT(*) OVER () AS _total
+                FROM items i JOIN ft ON ft.rid=i.id
+                WHERE {where_sql}
+                ORDER BY ft_rank ASC
+                LIMIT ? OFFSET ?""",
+            [fts_match] + params + [per_page, offset],
+        ).fetchall()
+        if rows:
+            total = rows[0]["_total"]
+        else:
+            total = conn.execute(
+                f"""SELECT COUNT(*) FROM items i
+                    WHERE i.id IN (SELECT rowid FROM items_fts
+                                   WHERE items_fts MATCH ?)
+                      AND {where_sql}""",
+                [fts_match] + params,
+            ).fetchone()[0]
     else:
+        total = conn.execute(
+            f"SELECT COUNT(*) FROM items i WHERE {where_sql}", params
+        ).fetchone()[0]
+        ft_join = ""
         if relevance and not fts_match:
             order_expr = "i.title ASC"
         else:
             order_expr = f"i.{sort} {direction} NULLS LAST"
-        sel_params = params + [per_page, offset]
-
-    rows = conn.execute(
-        f"""SELECT i.*,
-                   (SELECT GROUP_CONCAT(collection,'||') FROM item_collections ic
-                    WHERE ic.item_id = i.id) AS collections
-            FROM items i {ft_join}
-            WHERE {where_sql}
-            ORDER BY {order_expr}
-            LIMIT ? OFFSET ?""",
-        sel_params,
-    ).fetchall()
+        rows = conn.execute(
+            f"""SELECT i.*,
+                       (SELECT GROUP_CONCAT(collection,'||') FROM item_collections ic
+                        WHERE ic.item_id = i.id) AS collections
+                FROM items i {ft_join}
+                WHERE {where_sql}
+                ORDER BY {order_expr}
+                LIMIT ? OFFSET ?""",
+            params + [per_page, offset],
+        ).fetchall()
 
     conn.close()
+    items = [dict(r) for r in rows]
+    for it in items:
+        it.pop("_total", None)
     return {"total": total, "page": page, "per_page": per_page,
-            "items": [dict(r) for r in rows]}
+            "items": items}
 
 
 def get_item(item_id):
@@ -1388,17 +1449,25 @@ def get_stats(collection_id, ia_collection=None):
     conn = get_coll_db(collection_id)
     try:
         if ia_collection:
-            sub_where = ("i.id IN (SELECT item_id FROM item_collections "
-                         "WHERE collection=?)")
-            total    = conn.execute(
-                f"SELECT COUNT(*) FROM items i WHERE {sub_where}",
-                (ia_collection,)).fetchone()[0]
+            # Modified/pushed counts are tiny, so drive them off the indexed
+            # flag columns first and only probe membership for those few rows,
+            # instead of fetching every matched item's wide row.
+            total = conn.execute(
+                "SELECT COUNT(*) FROM item_collections WHERE collection=?",
+                (ia_collection,),
+            ).fetchone()[0]
             modified = conn.execute(
-                f"SELECT COUNT(*) FROM items i WHERE i.is_modified=1 AND {sub_where}",
-                (ia_collection,)).fetchone()[0]
-            pushed   = conn.execute(
-                f"SELECT COUNT(*) FROM items i WHERE i.is_pushed=1 AND {sub_where}",
-                (ia_collection,)).fetchone()[0]
+                """SELECT COUNT(*) FROM items i WHERE i.is_modified=1 AND EXISTS (
+                       SELECT 1 FROM item_collections ic
+                       WHERE ic.item_id=i.id AND ic.collection=?)""",
+                (ia_collection,),
+            ).fetchone()[0]
+            pushed = conn.execute(
+                """SELECT COUNT(*) FROM items i WHERE i.is_pushed=1 AND EXISTS (
+                       SELECT 1 FROM item_collections ic
+                       WHERE ic.item_id=i.id AND ic.collection=?)""",
+                (ia_collection,),
+            ).fetchone()[0]
         else:
             total    = conn.execute("SELECT COUNT(*) FROM items").fetchone()[0]
             modified = conn.execute(
@@ -1697,8 +1766,12 @@ def get_language_breakdown(collection_id, ia_collection=None, modified_only=Fals
     try:
         where, params = [], []
         if ia_collection:
+            # Drive from the covering (detected_language, translit_status)
+            # index and probe membership per entry — the membership index is
+            # small, so this beats joining the full matched items' wide rows.
             where.append(
-                "id IN (SELECT item_id FROM item_collections WHERE collection=?)"
+                "(EXISTS (SELECT 1 FROM item_collections ic "
+                "WHERE ic.item_id=items.id AND ic.collection=?))"
             )
             params.append(ia_collection)
         if modified_only:
@@ -1882,6 +1955,13 @@ def fts_status(collection_id):
         items = conn.execute("SELECT COUNT(*) FROM items").fetchone()[0]
         if not fts_supported():
             return {"items": items, "indexed": None}
+        row = conn.execute(
+            "SELECT value FROM coll_flags WHERE key='fts_count'"
+        ).fetchone()
+        if row is not None:
+            # Stored counter maintained by _fts_rebuild_conn/_fts_upsert:
+            # avoids the 20s+ COUNT(*) over the FTS5 virtual table.
+            return {"items": items, "indexed": int(row["value"])}
         try:
             indexed = conn.execute("SELECT COUNT(*) FROM items_fts").fetchone()[0]
         except Exception:
