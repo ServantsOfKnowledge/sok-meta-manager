@@ -671,10 +671,47 @@ def api_collection_stats(coll_id):
 
 @app.route("/api/stats/impact")
 def api_stats_impact():
-    """Aggregate impact metrics across all stored collections.
+    """Aggregate impact metrics across stored collections.
 
-    The heavy aggregate is computed in the background and persisted as a
-    snapshot; this endpoint serves the snapshot (fast) with a staleness flag."""
+    Default (no params) serves the persisted all-collections snapshot fast,
+    with a staleness flag.  ``?available=1`` lists the main and sub
+    collections available to focus on.  ``?scope=main&coll=<id>`` or
+    ``?scope=sub&coll=<id>&name=<sub>`` computes stats for just that
+    collection."""
+    if request.args.get("available"):
+        mains = [{"id": c["id"], "name": c["name"],
+                  "identifier": c["identifier"]} for c in db.list_collections()]
+        main_names = {m["name"].lower() for m in mains} | \
+                     {m["identifier"].lower() for m in mains}
+        subs = []
+        for m in mains:
+            for n in db.get_collection_names(m["id"], min_count=5, limit=400):
+                if n["name"].lower() in main_names:
+                    continue  # the main collection itself shows as a member
+                subs.append({"name": n["name"], "count": n["count"],
+                             "coll_id": m["id"], "main": m["name"]})
+        return ok({"main": mains, "sub": subs})
+
+    scope = request.args.get("scope")
+    if scope in ("main", "sub"):
+        try:
+            coll_id = int(request.args.get("coll", "") or 0)
+        except ValueError:
+            coll_id = 0
+        sub = (request.args.get("name") or "").strip() or None
+        payload = db.impact_stats(scope, coll_id, sub)
+        if payload is None:
+            return err("Collection or sub-collection not found", 404)
+        if scope == "main" and payload.get("from_snapshot"):
+            _, updated = db.load_impact_snapshot()
+            stale = updated is None or (time.time() - updated) > 300
+            live = False
+        else:
+            stale, live = False, True
+        return ok({"snapshot": payload, "updated_at": time.time(),
+                   "stale": stale, "live": live})
+
+    # Existing persisted-snapshot path for the whole store.
     payload, updated = db.load_impact_snapshot()
     empty = payload is None or not payload.get("collections")
     stale = empty or updated is None or (time.time() - updated) > 300

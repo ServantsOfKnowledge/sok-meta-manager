@@ -339,6 +339,7 @@ CREATE INDEX IF NOT EXISTS idx_items_year         ON items(year);
 CREATE INDEX IF NOT EXISTS idx_items_last_synced  ON items(last_synced);
 CREATE INDEX IF NOT EXISTS idx_items_last_modified ON items(last_modified);
 CREATE INDEX IF NOT EXISTS idx_ic_collection      ON item_collections(collection);
+CREATE INDEX IF NOT EXISTS idx_ic_coll_item       ON item_collections(collection, item_id);
 """
 
 
@@ -1412,16 +1413,13 @@ def get_stats(collection_id, ia_collection=None):
     return out
 
 
-def _collection_impact(coll_id):
-    """Aggregate impact metrics for one collection's items DB.
+def _impact_accumulate(rows):
+    """Aggregate impact metrics from an iterator of item rows in one pass.
 
-    Uses a single forward scan so huge collections (multi-GB SQLite files)
-    cost one pass instead of a dozen aggregate/full-sort queries."""
-    conn = get_coll_db(coll_id)
-    rows = conn.execute(
-        "SELECT identifier, title, detected_language, downloads, views_30d, "
-        "views_7d, imagecount, is_modified, is_pushed FROM items"
-    )
+    Thanks to a single forward scan, huge collections (multi-GB SQLite files)
+    cost one pass instead of a dozen aggregate/full-sort queries.  ``rows``
+    must yield (identifier, title, language, downloads, views_30d, views_7d,
+    imagecount, is_modified, is_pushed)."""
     langs: dict = {}
     top_dl: list = []
     top_views: list = []
@@ -1458,7 +1456,6 @@ def _collection_impact(coll_id):
             modified += 1
         if push:
             pushed += 1
-    conn.close()
     return {
         "items": items, "pages": pages, "pages_items": pages_items,
         "downloads": downloads, "views_30d": views_30d, "views_7d": views_7d,
@@ -1468,6 +1465,129 @@ def _collection_impact(coll_id):
         "top_downloads": [r for _, _, r in sorted(top_dl, reverse=True)],
         "top_views":     [r for _, _, r in sorted(top_views, reverse=True)],
     }
+
+
+def _collection_impact(coll_id):
+    """Aggregate impact metrics for one collection's items DB."""
+    conn = get_coll_db(coll_id)
+    try:
+        rows = conn.execute(
+            "SELECT identifier, title, detected_language, downloads, views_30d, "
+            "views_7d, imagecount, is_modified, is_pushed FROM items"
+        )
+        return _impact_accumulate(rows)
+    finally:
+        conn.close()
+
+
+def impact_sub_stats(coll_id, sub):
+    """Aggregate impact metrics restricted to items that belong to an IA
+    sub-collection ``sub`` (resolved via ``item_collections``).
+
+    Joined off the ``(collection, item_id)`` index so only the matched items
+    are touched instead of filtering every row of a huge collection."""
+    conn = get_coll_db(coll_id)
+    try:
+        rows = conn.execute(
+            """SELECT identifier, title, detected_language, downloads, views_30d,
+                      views_7d, imagecount, is_modified, is_pushed
+               FROM items i
+               JOIN item_collections ic ON ic.item_id = i.id
+               WHERE ic.collection = ?""",
+            (sub,),
+        )
+        return _impact_accumulate(rows)
+    finally:
+        conn.close()
+
+
+def _impact_out(coll_id, s, name, identifier, scope):
+    """Shape a ``_impact_accumulate`` result into the same payload format
+    ``get_impact_stats`` returns (so the impact view can render it)."""
+    per_collection = [{
+        "id": coll_id, "name": name, "identifier": identifier,
+        "items": s["items"], "pages": s["pages"], "pages_items": s["pages_items"],
+        "downloads": s["downloads"], "views_30d": s["views_30d"],
+        "views_7d": s["views_7d"], "languages": s["n_languages"],
+        "modified": s["modified"], "pushed": s["pushed"],
+    }]
+    return {
+        "collections": 1, "items": s["items"], "pages": s["pages"],
+        "pages_items": s["pages_items"], "downloads": s["downloads"],
+        "views_30d": s["views_30d"], "views_7d": s["views_7d"],
+        "modified": s["modified"], "pushed": s["pushed"],
+        "pending_push": s["modified"] - s["pushed"],
+        "languages": s["n_languages"],
+        "top_languages": sorted(s["languages"].items(),
+                                key=lambda kv: kv[1], reverse=True)[:20],
+        "top_downloads": s["top_downloads"][:10],
+        "top_views": s["top_views"][:10],
+        "per_collection": per_collection,
+        "scope": scope, "scope_name": name,
+    }
+
+
+def impact_stats(scope="all", coll_id=None, sub=None):
+    """Impact payload scoped to everything, one main collection, or one IA
+    sub-collection.  Scoped results are computed live and cached briefly."""
+    if scope == "all":
+        return get_impact_stats()
+    if coll_id is None:
+        return None
+    if scope == "main":
+        key = ("impact_main", coll_id)
+    elif scope == "sub":
+        key = ("impact_sub", coll_id, sub)
+    else:
+        return None
+    cached = cache_get(key)
+    if cached is not None:
+        return cached
+    if scope == "main":
+        # Serve main-collection stats from the persisted snapshot when we have
+        # a per-collection row (instant); a live full scan costs ~30s for huge
+        # collections, so only fall back to it if no row exists.
+        snap, _updated = load_impact_snapshot()
+        row = None
+        if snap:
+            for c in snap.get("per_collection") or []:
+                if c["id"] == coll_id:
+                    row = c
+                    break
+        if row is not None:
+            out = {
+                "collections": 1, "items": row["items"], "pages": row["pages"],
+                "pages_items": row.get("pages_items", 0),
+                "downloads": row["downloads"], "views_30d": row["views_30d"],
+                "views_7d": row.get("views_7d", 0),
+                "modified": row["modified"], "pushed": row["pushed"],
+                "pending_push": row["modified"] - row["pushed"],
+                "languages": row["languages"],
+                "top_languages": snap.get("top_languages", []),
+                "top_downloads": snap.get("top_downloads", []),
+                "top_views": snap.get("top_views", []),
+                "per_collection": [row],
+                "scope": "main", "scope_name": row["name"],
+                "from_snapshot": True,
+            }
+            cache_put(key, out, 30)
+            return out
+        try:
+            s = _collection_impact(coll_id)
+        except Exception:
+            return None
+        name = identifier = None
+        for c in list_collections():
+            if c["id"] == coll_id:
+                name, identifier = c["name"], c["identifier"]
+                break
+        if name is None:
+            return None
+        out = _impact_out(coll_id, s, name, identifier, "main")
+    else:
+        out = _impact_out(coll_id, impact_sub_stats(coll_id, sub), sub, sub, "sub")
+    cache_put(key, out, 5)
+    return out
 
 
 def get_impact_stats():

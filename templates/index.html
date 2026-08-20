@@ -755,9 +755,17 @@ th.sorted .th-sort{opacity:1;}
 
       <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:18px;">
         <h2 style="font-size:22px;font-weight:700;margin:0;color:var(--text1);">Impact Stats</h2>
-        <span style="font-size:12px;color:var(--text3);">Aggregate reach of every stored collection</span>${staleBadge}
+        <span style="font-size:12px;color:var(--text3);">Aggregate reach of every stored collection</span><span id="impact-stale-badge"></span>
         <span class="topbar-sep"></span>
         <button class="btn btn-ghost btn-sm" id="impact-refresh" onclick="loadImpactStats()">⟳ Refresh</button>
+      </div>
+
+      <div id="impact-scope-box" style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:20px;padding:12px 14px;background:var(--bg2);border:1px solid var(--border);border-radius:10px;">
+        <label for="impact-scope" style="font-size:13px;font-weight:600;color:var(--text2);">Show stats for</label>
+        <select id="impact-scope" class="f-select" style="min-width:280px;padding:6px 10px;" onchange="onImpactScope()">
+          <option value="all">All collections</option>
+        </select>
+        <span id="impact-scope-hint" style="font-size:11px;color:var(--text3);"></span>
       </div>
 
       <div id="impact-summary" style="display:flex;gap:12px;flex-wrap:wrap;margin-bottom:20px;">
@@ -949,6 +957,7 @@ const S = {
   sort:             'title',
   sortDir:          'asc',
   userSort:         false, // true once the user explicitly clicks a sort column
+  impactCollId:     null, // main collection id for scoped impact stats
   activeItem:       null,
   syncTimer:        null,
   langData:         [],
@@ -2297,9 +2306,64 @@ async function loadHomeStats() {
 }
 
 // ── Impact stats view ─────────────────────────────────────────────────────────
+let impactScope = 'all';              // 'all' | 'main' | 'sub'
+let impactScopeName = 'All collections';
+let impactAvailable = null;           // {main:[], sub:[]} picker options (cached)
+
+async function ensureImpactOptions() {
+  if (impactAvailable) return impactAvailable;
+  const r = await api('/api/stats/impact?available=1');
+  impactAvailable = (r.data && (r.data.main || r.data.sub)) ? r.data : {main:[], sub:[]};
+  const sel = document.getElementById('impact-scope');
+  if (!sel) return impactAvailable;
+  sel.innerHTML = '<option value="all">All collections</option>';
+  if (impactAvailable.main.length) {
+    const g = document.createElement('optgroup'); g.label = 'Main collections';
+    impactAvailable.main.forEach(m => { const o=document.createElement('option'); o.value='main:'+m.id; o.textContent=m.name; g.appendChild(o); });
+    sel.appendChild(g);
+  }
+  if (impactAvailable.sub.length) {
+    const g = document.createElement('optgroup'); g.label = 'Sub-collections';
+    impactAvailable.sub.forEach(s => { const o=document.createElement('option'); o.value='sub:'+s.coll_id+':'+s.name; o.textContent=s.name+' ('+(s.count||0).toLocaleString()+')'; g.appendChild(o); });
+    sel.appendChild(g);
+  }
+  if (impactScope !== 'all') syncImpactScopeSelect();
+  return impactAvailable;
+}
+
+function syncImpactScopeSelect() {
+  const sel = document.getElementById('impact-scope');
+  if (!sel) return;
+  const val = impactScope==='all' ? 'all'
+    : impactScope==='main' ? 'main:'+S.impactCollId
+    : 'sub:'+S.impactCollId+':'+S.impactScopeName;
+  sel.value = val;
+}
+
+async function onImpactScope() {
+  const v = document.getElementById('impact-scope').value;
+  impactScope = 'all'; impactScopeName = 'All collections';
+  if (v.startsWith('main:')) { impactScope='main'; S.impactCollId = parseInt(v.split(':')[1]||'0',10); impactScopeName=''; }
+  else if (v.startsWith('sub:')) { const p=v.split(':'); impactScope='sub'; S.impactCollId=parseInt(p[1]||'0',10); impactScopeName=p.slice(2).join(':')||''; }
+  else impactScope='all';
+  loadImpactStats();
+}
+
 async function loadImpactStats() {
-  const r = await api('/api/stats/impact');
+  await ensureImpactOptions();
+  let url = '/api/stats/impact';
+  if (impactScope==='main') url += '?scope=main&coll='+S.impactCollId;
+  else if (impactScope==='sub') url += '?scope=sub&coll='+S.impactCollId+'&name='+encodeURIComponent(impactScopeName);
   const el = document.getElementById('impact-summary');
+  if (impactScope!=='all' && el) {
+    const note = `<div style="color:var(--text3);font-size:13px;">Computing stats for ${esc(impactScopeName||'collection')} (scans the matched items)…</div>`;
+    el.innerHTML = note;
+    document.getElementById('impact-languages').innerHTML = note;
+    document.getElementById('impact-top-downloads').innerHTML = note;
+    document.getElementById('impact-top-views').innerHTML = note;
+    document.getElementById('impact-collections').innerHTML = note;
+  }
+  const r = await api(url);
   if (!r.ok || !el) return;
   const needsCompute = !r.data || !r.data.snapshot;
   if (needsCompute) {
@@ -2312,10 +2376,17 @@ async function loadImpactStats() {
     setTimeout(() => loadImpactStats(), 5000);
     return;
   }
+  const scoped = r.data.live || (r.data.snapshot && r.data.snapshot.scope && r.data.snapshot.scope!=='all');
+  const scopeHdr = scoped ? esc(impactScopeName || r.data.snapshot.scope_name || '') : '';
   const staleBadge = r.data.stale
-    ? '<span style="font-size:11px;color:var(--amber);margin-left:4px;" title="Numbers reflect the last computed snapshot">· stale — refreshing…</span>' : '';
+    ? '<span style="font-size:11px;color:var(--amber);margin-left:4px;" title="Numbers reflect the last computed snapshot">· stale — refreshing…</span>'
+    : scoped ? '<span style="font-size:11px;color:var(--text3);margin-left:4px;">· showing '+scopeHdr+'</span>' : '';
   const s = r.data.snapshot;
   const f = n => (n||0).toLocaleString();
+
+  document.getElementById('impact-scope-hint').textContent = scoped ? `Showing stats for ${scopeHdr} only.` : '';
+  const badgeEl = document.getElementById('impact-stale-badge');
+  if (badgeEl) badgeEl.innerHTML = staleBadge;
 
   el.innerHTML = [
     ['📚','Items',f(s.items)],
@@ -2323,7 +2394,7 @@ async function loadImpactStats() {
     ['🌐','Languages',f(s.languages)],
     ['⬇','Downloads',f(s.downloads)],
     ['👁','Views (30d)',f(s.views_30d)],
-    ['🗂','Collections',f(s.collections)],
+    ['🗂', scoped ? 'Collection' : 'Collections', scoped ? scopeHdr : f(s.collections)],
   ].map(([ic,label,val]) => `
     <div style="flex:1;min-width:150px;background:var(--bg2);border:1px solid var(--border);border-radius:10px;padding:14px 16px;">
       <div style="font-size:12px;color:var(--text3);">${ic} ${label}</div>
@@ -2364,8 +2435,31 @@ async function loadImpactStats() {
     ? `<table style="width:100%;border-collapse:collapse;"><tbody>${rows(s.top_views)}</tbody></table>`
     : '<span style="color:var(--text3);font-size:13px;">No view data yet — run a “Fetch Stats” job.</span>';
 
-  document.getElementById('impact-collections').innerHTML = `
-    <table style="width:100%;border-collapse:collapse;min-width:780px;">
+  document.getElementById('impact-collections').innerHTML = (scoped
+    ? `<table style="width:100%;border-collapse:collapse;">
+        <tr style="background:var(--bg3);color:var(--text2);font-size:11px;text-transform:uppercase;letter-spacing:.05em;">
+          <th style="padding:8px 10px;text-align:left;">Collection</th>
+          <th style="padding:8px 10px;text-align:right;">Items</th>
+          <th style="padding:8px 10px;text-align:right;">Pages</th>
+          <th style="padding:8px 10px;text-align:right;">Languages</th>
+          <th style="padding:8px 10px;text-align:right;">Downloads</th>
+          <th style="padding:8px 10px;text-align:right;">Views 30d</th>
+          <th style="padding:8px 10px;text-align:right;">Modified</th>
+          <th style="padding:8px 10px;text-align:right;">Pushed</th>
+        </tr>
+        ${s.per_collection.map(c => `
+          <tr style="border-top:1px solid var(--border);">
+            <td style="padding:7px 10px;font-size:13px;color:var(--text1);">${esc(c.name||c.identifier)}</td>
+            <td style="padding:7px 10px;text-align:right;font-size:13px;color:var(--text2);">${f(c.items)}</td>
+            <td style="padding:7px 10px;text-align:right;font-size:13px;color:var(--text2);">${f(c.pages)}<div style="font-size:10px;color:var(--text3);">${c.pages_items ? f(c.pages_items)+' items' : 'no counts'}</div></td>
+            <td style="padding:7px 10px;text-align:right;font-size:13px;color:var(--text2);">${c.languages}</td>
+            <td style="padding:7px 10px;text-align:right;font-size:13px;color:var(--text2);">${f(c.downloads)}</td>
+            <td style="padding:7px 10px;text-align:right;font-size:13px;color:var(--text2);">${f(c.views_30d)}</td>
+            <td style="padding:7px 10px;text-align:right;font-size:13px;color:var(--text2);">${f(c.modified)}</td>
+            <td style="padding:7px 10px;text-align:right;font-size:13px;color:var(--text2);">${f(c.pushed)}</td>
+          </tr>`).join('')}
+      </table>`
+    : `<table style="width:100%;border-collapse:collapse;min-width:780px;">
       <thead><tr style="background:var(--bg3);color:var(--text2);font-size:11px;text-transform:uppercase;letter-spacing:.05em;">
         <th style="padding:8px 10px;text-align:left;">Collection</th>
         <th style="padding:8px 10px;text-align:right;">Items</th>
@@ -2391,8 +2485,8 @@ async function loadImpactStats() {
             <td style="padding:7px 10px;text-align:right;"><button class="btn btn-ghost btn-sm" onclick="startFetchPages(${c.id})" title="Backfill page counts (imagecount) for this collection">+ Pages</button></td>
           </tr>`).join('')}
       </tbody>
-    </table>`;
-  if (r.data.stale) setTimeout(() => loadImpactStats(), 15000);
+    </table>`);
+  if (r.data.stale && !scoped) setTimeout(() => loadImpactStats(), 15000);
 }
 
 async function startFetchPages(collId) {
