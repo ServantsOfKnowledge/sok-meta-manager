@@ -1098,6 +1098,8 @@ def set_item_membership(collection_id, item_id, coll_name, present):
 def list_items(collection_id, search=None, modified_only=False,
                lang_code=None, translit_status=None,
                ia_collection=None, ia_collection_not=None,
+               date_published=None, date_archived=None, date_reviewed=None,
+               creator=None,
                page=1, per_page=50, sort="title", sort_dir="asc"):
     conn = get_coll_db(collection_id)
     where, params = [], []
@@ -1116,6 +1118,18 @@ def list_items(collection_id, search=None, modified_only=False,
     if translit_status:
         where.append("i.translit_status=?")
         params.append(translit_status)
+    if date_published:
+        where.append("i.date LIKE ?")
+        params.append(date_published + "%")
+    if creator:
+        where.append("i.creator LIKE ?")
+        params.append(f"%{creator}%")
+    if date_archived:
+        where.append("i.date LIKE ?")
+        params.append(date_archived + "%")
+    if date_reviewed:
+        where.append("i.date LIKE ?")
+        params.append(date_reviewed + "%")
     allowed = {"title", "identifier", "creator", "author", "publisher",
                "date", "year", "last_modified", "last_synced",
                "detected_language", "rank", "relevance"}
