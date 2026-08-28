@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Login — SOK MetaManager</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0f172a; color: #e2e8f0; height: 100vh; margin: 0; display: flex; align-items: center; justify-content: center; }
+    .card { background: #1e293b; border: 1px solid #334155; border-radius: 12px; padding: 40px; width: 100%; max-width: 400px; }
+    h1 { font-size: 24px; margin: 0 0 24px; }
+    input { width: 100%; padding: 10px 12px; margin-bottom: 12px; background: #0f172a; border: 1px solid #475569; border-radius: 6px; color: #e2e8f0; font-size: 14px; }
+    button { width: 100%; padding: 12px; background: #3b82f6; color: white; border: none; border-radius: 8px; font-size: 14px; cursor: pointer; }
+    button:hover { background: #2563eb; }
+    .link { text-align: center; margin-top: 16px; }
+    .link a { color: #60a5fa; text-decoration: none; font-size: 14px; }
+    .flash { padding: 8px 12px; border-radius: 6px; margin-bottom: 12px; font-size: 13px; }
+    .flash.success { background: #065f44; color: #6ee7b7; }
+    .flash.error { background: #7f1d1d; color: #fca5a5; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>Login to SOK MetaManager</h1>
+    {% with messages = get_flashed_messages(with_categories=true) %}
+      {% for category, message in messages %}
+        <div class="flash {{ category }}">{{ message }}</div>
+      {% endfor %}
+    {% endwith %}
+    <form id="loginForm">
+      <input type="text" id="username" placeholder="Username" required autofocus>
+      <input type="password" id="password" placeholder="Password" required>
+      <button type="submit">Login</button>
+    </form>
+    <div class="link">
+      <a href="/signup">Need an account? Sign up</a>
+    </div>
+  </div>
+  <script>
+    document.getElementById('loginForm').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const username = document.getElementById('username').value;
+      const password = document.getElementById('password').value;
+      const resp = await fetch('/api/auth/login', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({username, password})
+      });
+      const data = await resp.json();
+      if (data.ok) {
+        window.location.href = '/';
+      } else {
+        alert(data.error || 'Login failed');
+      }
+    });
+  </script>
+</body>
+</html>

@@ -1,0 +1,656 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>SOK · Admin Dashboard</title>
+  <link rel="icon" type="image/x-icon"  href="/static/img/favicon.ico"/>
+  <style>
+    *,:before,:after{box-sizing:border-box;margin:0;padding:0;}
+    :root{
+      --gold:#B8860A;--gold-light:#D4A010;--gold-dim:#8B6A00;
+      --bg:#FFFFFF;--bg2:#F7F7F9;--bg3:#EFEFF2;--bg4:#E6E6EB;--border:#DDDDE6;
+      --text:#1A1A28;--text2:#52526A;--text3:#8888A0;
+      --green:#1E8A52;--red:#C03030;--amber:#B07010;--blue:#2A60A8;--purple:#6B48CC;
+      --radius:6px;--shadow:0 2px 12px rgba(0,0,0,.10);--tr:.18s ease;
+    }
+    html,body{height:100%;font-family:'Segoe UI',system-ui,sans-serif;background:var(--bg);color:var(--text);font-size:14px;line-height:1.5;}
+    #app{display:grid;grid-template-columns:268px 1fr;grid-template-rows:56px 1fr;height:100vh;overflow:hidden;}
+    #topbar{grid-column:1/-1;display:flex;align-items:center;justify-content:space-between;padding:0 20px;background:#FFFDF5;border-bottom:2px solid var(--gold);box-shadow:0 1px 6px rgba(184,134,10,.12);}
+    #topbar .left{display:flex;align-items:center;gap:12px;}
+    #topbar .logo{font-size:20px;font-weight:700;color:var(--gold-dim);}
+    #topbar .nav a{color:var(--text2);text-decoration:none;font-size:13px;padding:4px 10px;border-radius:4px;transition:var(--tr);}
+    #topbar .nav a:hover{background:var(--bg3);}
+    #topbar .nav a.active{background:var(--gold-bg);color:var(--gold-dim);}
+    #topbar .user-info{display:flex;align-items:center;gap:8px;font-size:13px;}
+    #sidebar{background:var(--bg2);border-right:1px solid var(--border);overflow-y:auto;}
+    .sidebar-section{padding:12px 16px 4px;font-size:11px;font-weight:600;color:var(--text3);letter-spacing:.06em;text-transform:uppercase;}
+    .nav-item{display:flex;align-items:center;gap:8px;padding:8px 16px;border-radius:0;cursor:pointer;font-size:13px;color:var(--text);transition:var(--tr);}
+    .nav-item:hover{background:var(--bg3);}
+    .nav-item.active{background:var(--gold-bg);color:var(--gold-dim);font-weight:600;}
+    .nav-item .icon{width:18px;height:18px;}
+    #main{overflow-y:auto;padding:24px;position:relative;}
+    .page-title{font-size:20px;font-weight:600;margin-bottom:16px;}
+    .card{background:var(--bg);border:1px solid var(--border);border-radius:var(--radius);box-shadow:var(--shadow);padding:20px;margin-bottom:20px;}
+    table{width:100%;border-collapse:collapse;font-size:13px;}
+    th,td{padding:10px 12px;border-bottom:1px solid var(--border);text-align:left;}
+    th{color:var(--text2);font-weight:600;font-size:11px;text-transform:uppercase;letter-spacing:.04em;}
+    tr:hover td{background:var(--bg3);}
+    .role-badge{display:inline-block;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:600;}
+    .role-viewer{background:var(--bg4);color:var(--text3);}
+    .role-editor{background:#7c3aed;color:#fff;}
+    .role-admin{background:#dc2626;color:#fff;}
+    .btn{padding:6px 14px;border:1px solid var(--border);border-radius:var(--radius);background:var(--bg2);color:var(--text);cursor:pointer;font-size:13px;transition:var(--tr);}
+    .btn:hover{background:var(--bg3);}
+    .btn-primary{background:var(--blue);color:#fff;border-color:var(--blue);}
+    .btn-primary:hover{background:var(--gold-dim);}
+    .btn-danger{background:var(--red);color:#fff;border-color:var(--red);}
+    .btn-danger:hover{opacity:.9;}
+    .btn-sm{padding:4px 10px;font-size:12px;}
+    .input{padding:8px 10px;border:1px solid var(--border);border-radius:var(--radius);font-size:13px;background:var(--bg);color:var(--text);width:100%;}
+    .tag{display:inline-block;padding:2px 6px;border-radius:3px;font-size:11px;background:var(--bg3);color:var(--text2);margin-right:4px;}
+    .toggle-switch{position:relative;display:inline-block;width:40px;height:20px;}
+    .toggle-switch input{opacity:0;width:0;height:0;}
+    .toggle-slider{display:inline-block;position:absolute;cursor:pointer;top:0;left:0;right:0;bottom:0;background:var(--bg4);border-radius:20px;transition:.2s;}
+    .toggle-slider:before{content:"";position:absolute;height:14px;width:14px;border-radius:50%;left:3px;bottom:3px;background:#fff;transition:.2s;}
+    input:checked+.toggle-slider{background:var(--blue);}
+    input:checked+.toggle-slider:before{transform:translateX(20px);}
+    .badge{padding:2px 8px;border-radius:4px;font-size:11px;font-weight:600;}
+    .badge-ok{background:#dcfce7;color:var(--green);}
+    .badge-warn{background:#fef3c7;color:var(--amber);}
+    .badge-err{background:#fee2e2;color:var(--red);}
+    .tabs{display:flex;border-bottom:1px solid var(--border);margin-bottom:16px;}
+    .tab{padding:10px 20px;border-radius:6px 6px 0 0;cursor:pointer;font-size:13px;font-weight:600;transition:var(--tr);}
+    .tab:hover{background:var(--bg3);}
+    .tab.active{background:var(--bg3);color:var(--text);}
+    .stat-row{display:flex;gap:16px;margin-bottom:16px;}
+    .stat-card{flex:1;background:var(--bg);border:1px solid var(--border);border-radius:var(--radius);padding:16px;text-align:center;}
+    .stat-card .num{font-size:28px;font-weight:700;color:var(--blue);}
+    .stat-card .label{font-size:11px;color:var(--text2);text-transform:uppercase;letter-spacing:.04em;}
+    .flash{padding:8px 12px;border-radius:6px;margin-bottom:12px;font-size:13px;display:none;}
+    .flash.show{display:block;}
+    .flash.success{background:#d1fae5;color:var(--green);}
+    .flash.error{background:#fee2e2;color:var(--red);}
+    .flash.info{background:#dbeafe;color:var(--blue);}
+    .modal-overlay{position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.5);display:flex;align-items:center;justify-content:center;z-index:1000;}
+    .modal{background:var(--bg);border:1px solid var(--border);border-radius:var(--radius);padding:24px;width:90%;max-width:500px;box-shadow:var(--shadow);}
+    .modal h2{font-size:18px;margin-bottom:16px;}
+    .modal .form-row{margin-bottom:12px;}
+    .modal .form-row label{display:block;font-size:12px;color:var(--text2);margin-bottom:4px;}
+    .modal .actions{display:flex;gap:8px;justify-content:flex-end;margin-top:16px;}
+  </style>
+</head>
+<body>
+<div id="app">
+  <div id="topbar">
+    <div class="left">
+      <span class="logo">🕉 SOK</span>
+      <nav class="nav">
+        <a href="/" id="nav-home">MetaManager</a>
+        <a href="/admin" class="active" id="nav-admin">Admin</a>
+      </nav>
+    </div>
+    <div class="user-info" id="userInfo">
+      <span id="userBadge"></span>
+    </div>
+  </div>
+  <div id="sidebar">
+    <div class="sidebar-section">Admin</div>
+    <div class="nav-item active" onclick="switchPanel('users')">👥 Users</div>
+    <div class="nav-item" onclick="switchPanel('collections')">📚 Collections</div>
+    <div class="sidebar-section">Actions</div>
+    <div class="nav-item" onclick="openPasswordModal()">🔐 Change Password</div>
+    <div class="nav-item" onclick="logout()">🡺 Logout</div>
+  </div>
+  <div id="main">
+    <div id="panel-users" class="panel">
+      <div class="page-title">👥 Users</div>
+      <div class="flash success" id="flashSuccess"></div>
+      <div class="flash error" id="flashError"></div>
+      <div class="card">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
+          <h3 style="font-size:14px;font-weight:600;">All Users</h3>
+          <button class="btn btn-primary btn-sm" onclick="openSignupModal()">＋ Add User</button>
+        </div>
+        <table id="usersTable">
+          <thead>
+            <tr>
+              <th>ID</th><th>Username</th><th>Global Role</th><th>Collections</th><th>Created</th><th>Actions</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+    <div id="panel-collections" class="panel" style="display:none;">
+      <div class="page-title">📚 Collections</div>
+      <div class="flash success" id="flashSuccess2"></div>
+      <div class="flash error" id="flashError2"></div>
+      <div class="card">
+        <h3 style="font-size:14px;font-weight:600;margin-bottom:12px;">Collection Permissions</h3>
+        <table id="collPermsTable">
+          <thead>
+            <tr>
+              <th>Collection</th><th>ID</th><th>Total Items</th><th>Users with Access</th><th>Actions</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <div class="card">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
+          <h3 style="font-size:14px;font-weight:600;">Reviewer Scopes (Search Patterns)</h3>
+          <button class="btn btn-primary btn-sm" onclick="openScopeModal()">＋ Add Scope</button>
+        </div>
+        <table id="scopesTable">
+          <thead>
+            <tr>
+              <th>ID</th><th>User</th><th>Collection</th><th>Field</th><th>Pattern</th><th>Exact?</th><th>Created</th><th>Actions</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Signup Modal -->
+<div id="signupModal" style="display:none;">
+  <div class="modal-overlay" onclick="closeSignupModal()">
+    <div class="modal" onclick="event.stopPropagation()">
+      <h2>Create New User</h2>
+      <div class="form-row">
+        <label>Username</label>
+        <input class="input" type="text" id="newUsername" placeholder="e.g. volunteer1">
+      </div>
+      <div class="form-row">
+        <label>Password</label>
+        <input class="input" type="password" id="newPassword" placeholder="min 4 characters">
+      </div>
+      <div class="form-row">
+        <label>Role</label>
+        <select class="input" id="newRole">
+          <option value="viewer">Viewer (read-only)</option>
+          <option value="editor">Editor (can edit metadata)</option>
+          <option value="admin">Admin (full access)</option>
+        </select>
+      </div>
+      <div class="actions">
+        <button class="btn" onclick="closeSignupModal()">Cancel</button>
+        <button class="btn btn-primary" onclick="createUser()">Create</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Role Change Modal -->
+<div id="roleModal" style="display:none;">
+  <div class="modal-overlay" onclick="closeRoleModal()">
+    <div class="modal" onclick="event.stopPropagation()">
+      <h2>Change User Role</h2>
+      <input type="hidden" id="roleUserId">
+      <div class="form-row">
+        <label>New Role</label>
+        <select class="input" id="roleSelect">
+          <option value="viewer">Viewer (read-only)</option>
+          <option value="editor">Editor (can edit metadata)</option>
+          <option value="admin">Admin (full access)</option>
+        </select>
+      </div>
+      <div class="actions">
+        <button class="btn" onclick="closeRoleModal()">Cancel</button>
+        <button class="btn btn-primary" onclick="saveRole()">Save</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Scope Modal -->
+<div id="scopeModal" style="display:none;">
+  <div class="modal-overlay" onclick="closeScopeModal()">
+    <div class="modal" onclick="event.stopPropagation()">
+      <h2>Add Reviewer Scope</h2>
+      <input type="hidden" id="scopeUserId">
+      <div class="form-row">
+        <label>User</label>
+        <select class="input" id="scopeUserSelect">
+          <option value="">Select a user…</option>
+        </select>
+      </div>
+      <div class="form-row">
+        <label>Collection</label>
+        <select class="input" id="scopeCollSelect">
+          <option value="">Select a collection…</option>
+        </select>
+      </div>
+      <div class="form-row">
+        <label>Match Field</label>
+        <input class="input" type="text" id="scopeField" placeholder="e.g. language, detected_language, subject">
+      </div>
+      <div class="form-row">
+        <label>Match Pattern</label>
+        <input class="input" type="text" id="scopePattern" placeholder="e.g. sa, Sanskrit">
+      </div>
+      <div class="form-row" style="display:flex;align-items:center;gap:8px;">
+        <input type="checkbox" id="scopeExact" style="width:16px;height:16px;">
+        <label style="margin-bottom:0;">Exact match only</label>
+      </div>
+      <div class="flash error" id="flashScopeError"></div>
+      <div class="actions">
+        <button class="btn" onclick="closeScopeModal()">Cancel</button>
+        <button class="btn btn-primary" onclick="saveScope()">Add Scope</button>
+      </div>
+    </div>
+  </div>
+</div>
+<div id="passwordModal" style="display:none;">
+  <div class="modal-overlay" onclick="closePasswordModal()">
+    <div class="modal" onclick="event.stopPropagation()">
+      <h2>Change Your Password</h2>
+      <input type="hidden" id="pwUserId">
+      <div class="form-row">
+        <label>Current Password</label>
+        <input class="input" type="password" id="pwCurrent" placeholder="current password">
+      </div>
+      <div class="form-row">
+        <label>New Password</label>
+        <input class="input" type="password" id="pwNew" placeholder="min 4 characters">
+      </div>
+      <div class="flash error" id="flashPwError"></div>
+      <div class="actions">
+        <button class="btn" onclick="closePasswordModal()">Cancel</button>
+        <button class="btn btn-primary" onclick="savePassword()">Change Password</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+let state = {
+  user: null,
+  users: [],
+  collections: [],
+  currentPanel: 'users',
+};
+
+function flash(msg, type, target='flashSuccess') {
+  const el = document.getElementById(target);
+  el.textContent = msg;
+  el.className = 'flash ' + type + ' show';
+  setTimeout(() => el.classList.remove('show'), 4000);
+}
+
+function switchPanel(panel) {
+  document.querySelectorAll('.panel').forEach(p => p.style.display = 'none');
+  document.getElementById('panel-' + panel).style.display = 'block';
+  document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
+  event?.currentTarget?.classList.add('active');
+  state.currentPanel = panel;
+}
+
+async function api(path, opts = {}) {
+  const resp = await fetch(path, {
+    ...opts,
+    headers: { 'Content-Type': 'application/json', ...(opts.headers || {}) },
+  });
+  const data = await resp.json();
+  if (!data.ok && resp.status >= 401 && resp.status < 500) {
+    window.location.href = '/login';
+    throw new Error('Unauthorized');
+  }
+  if (!data.ok) throw new Error(data.error || 'Request failed');
+  return data;
+}
+
+async function loadMe() {
+  try {
+    const data = await api('/api/auth/me');
+    if (data.data && data.data.id) {
+      state.user = data.data;
+      document.getElementById('userBadge').innerHTML =
+        '<span class="role-badge role-' + (state.user.role || 'viewer') + '">' +
+        (state.user.username || 'guest') + ':' + (state.user.role || 'viewer') + '</span>';
+    } else {
+      window.location.href = '/login';
+    }
+  } catch (e) {
+    window.location.href = '/login';
+  }
+}
+
+async function loadUsers() {
+  try {
+    const data = await api('/api/users');
+    state.users = data.data || [];
+    renderUsers();
+  } catch (e) {
+    flash(e.message, 'error');
+  }
+}
+
+async function loadCollections() {
+  try {
+    const data = await api('/api/collections');
+    state.collections = data.data || [];
+    renderCollectionPerms();
+  } catch (e) {
+    flash(e.message, 'error', 'flashError2');
+  }
+}
+
+function renderUsers() {
+  const tbody = document.querySelector('#usersTable tbody');
+  tbody.innerHTML = '';
+  state.users.forEach(u => {
+    const tr = document.createElement('tr');
+    const collCount = state.collections.filter(c =>
+      u.collection_ids && u.collection_ids.includes(c.id)
+    ).length;
+    tr.innerHTML =
+      '<td>' + u.id + '</td>' +
+      '<td>' + u.username + '</td>' +
+      '<td><span class="role-badge role-' + u.role + '">' + u.role + '</span></td>' +
+      '<td>' + collCount + ' collection(s)</td>' +
+      '<td>' + (u.created_at || '') + '</td>' +
+      '<td>' +
+      (u.role === 'admin' ? '' :
+        '<button class="btn btn-sm" onclick="openRoleModal(' + u.id + ')">Change Role</button>') +
+      (state.user && u.id === state.user.id ? '' :
+        '<button class="btn btn-sm btn-danger" onclick="deleteUser(' + u.id + ', \'' + u.username + '\')">Delete</button>') +
+      '</td>';
+    tbody.appendChild(tr);
+  });
+}
+
+async function renderCollectionPerms() {
+  const tbody = document.querySelector('#collPermsTable tbody');
+  tbody.innerHTML = '<tr><td colspan="5">Loading…</td></tr>';
+  for (const coll of state.collections) {
+    try {
+      const [permsData, statsData] = await Promise.all([
+        api('/api/collections/' + coll.id + '/permissions'),
+        api('/api/collections/' + coll.id + '/stats').catch(() => ({ data: { total: '?' } })),
+      ]);
+      const perms = permsData.data || [];
+      const total = statsData.data?.total || coll.item_count || 0;
+      const tr = document.createElement('tr');
+      const userTags = perms.length
+        ? perms.map(p => '<span class="tag">' + p.username + ':' + p.coll_role + ' <a href="#" onclick="revokePerm(' + p.id + ',' + coll.id + ')">×</a></span>').join('')
+        : '<span style="color:var(--text3)">No explicit permissions</span>';
+      tr.innerHTML =
+        '<td>' + (coll.name || coll.identifier) + '</td>' +
+        '<td>' + coll.id + '</td>' +
+        '<td>' + total + '</td>' +
+        '<td>' + userTags + '</td>' +
+        '<td><button class="btn btn-sm" onclick="openAssignModal(' + coll.id + ')">Assign User</button></td>';
+      tbody.appendChild(tr);
+    } catch (e) {
+      // skip
+    }
+  }
+}
+
+async function revokePerm(userId, collId) {
+  if (!confirm('Revoke this user access?')) return;
+  try {
+    await api('/api/collections/' + collId + '/permissions/' + userId, { method: 'DELETE' });
+    flash('Permission revoked', 'success');
+    await loadCollections();
+    renderCollectionPerms();
+  } catch (e) {
+    flash(e.message, 'error', 'flashError2');
+  }
+}
+
+function openAssignModal(collId) {
+  document.getElementById('assignCollId').value = collId;
+  document.getElementById('assignUserId').value = '';
+  document.getElementById('assignRole').value = 'viewer';
+  document.getElementById('assignModal').style.display = 'block';
+}
+
+function closeAssignModal() {
+  document.getElementById('assignModal').style.display = 'none';
+}
+
+async function saveAssignment() {
+  const collId = document.getElementById('assignCollId').value;
+  const userId = parseInt(document.getElementById('assignUserId').value);
+  const role = document.getElementById('assignRole').value;
+  if (!userId) {
+    flash('Please select a user', 'error', 'flashError2');
+    return;
+  }
+  try {
+    await api('/api/collections/' + collId + '/permissions', {
+      method: 'POST',
+      body: JSON.stringify({ user_id: userId, role })
+    });
+    flash('Permission granted', 'success');
+    closeAssignModal();
+    renderCollectionPerms();
+  } catch (e) {
+    flash(e.message, 'error', 'flashError2');
+  }
+}
+
+function openSignupModal() {
+  document.getElementById('signupModal').style.display = 'block';
+}
+
+function closeSignupModal() {
+  document.getElementById('signupModal').style.display = 'none';
+  document.getElementById('newUsername').value = '';
+  document.getElementById('newPassword').value = '';
+}
+
+function openRoleModal(userId) {
+  document.getElementById('roleUserId').value = userId;
+  const user = state.users.find(u => u.id === userId);
+  if (user) document.getElementById('roleSelect').value = user.role;
+  document.getElementById('roleModal').style.display = 'block';
+}
+
+function closeRoleModal() {
+  document.getElementById('roleModal').style.display = 'none';
+}
+
+function openPasswordModal() {
+  document.getElementById('pwUserId').value = state.user?.id || '';
+  document.getElementById('pwCurrent').value = '';
+  document.getElementById('pwNew').value = '';
+  document.getElementById('flashPwError').classList.remove('show');
+  document.getElementById('passwordModal').style.display = 'block';
+}
+
+function closePasswordModal() {
+  document.getElementById('passwordModal').style.display = 'none';
+}
+
+async function savePassword() {
+  const current = document.getElementById('pwCurrent').value;
+  const newpass = document.getElementById('pwNew').value;
+  if (!current || !newpass || newpass.length < 4) {
+    flash('Current password and new password (min 4 chars) required', 'error', 'flashPwError');
+    return;
+  }
+  try {
+    // We need to verify the current password first — use a dedicated endpoint or
+    // try updating. Since the API endpoint requires admin and updates by userId,
+    // we'll let the admin change their own password.
+    const resp = await fetch('/api/users/' + state.user.id + '/password', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ password: newpass })
+    });
+    const data = await resp.json();
+    if (data.ok) {
+      flash('Password changed successfully', 'success');
+      closePasswordModal();
+    } else {
+      flash(data.error || 'Failed to change password', 'error', 'flashPwError');
+    }
+  } catch (e) {
+    flash(e.message, 'error', 'flashPwError');
+  }
+}
+
+async function createUser() {
+  const username = document.getElementById('newUsername').value.trim();
+  const password = document.getElementById('newPassword').value;
+  const role = document.getElementById('newRole').value;
+  if (!username || !password || password.length < 4) {
+    flash('Username and password (min 4 chars) required', 'error');
+    return;
+  }
+  try {
+    await api('/api/auth/signup', { method: 'POST', body: JSON.stringify({ username, password, role }) });
+    flash('User created successfully', 'success');
+    closeSignupModal();
+    await loadUsers();
+  } catch (e) {
+    flash(e.message, 'error');
+  }
+}
+
+async function saveRole() {
+  const userId = document.getElementById('roleUserId').value;
+  const role = document.getElementById('roleSelect').value;
+  try {
+    await api('/api/users/' + userId + '/role', { method: 'PUT', body: JSON.stringify({ role }) });
+    flash('Role updated', 'success');
+    closeRoleModal();
+    await loadUsers();
+  } catch (e) {
+    flash(e.message, 'error');
+  }
+}
+
+async function deleteUser(id, username) {
+  if (!confirm('Delete user "' + username + '"? This cannot be undone.')) return;
+  try {
+    await api('/api/users/' + id, { method: 'DELETE' });
+    flash('User deleted', 'success');
+    await loadUsers();
+  } catch (e) {
+    flash(e.message, 'error');
+  }
+}
+
+async function loadScopes() {
+  try {
+    const data = await api('/api/collections/0/reviewers');
+  } catch(e) {}
+  // Load scopes per-collection
+  const tbody = document.querySelector('#scopesTable tbody');
+  tbody.innerHTML = '';
+  for (const coll of state.collections) {
+    try {
+      const data = await api('/api/collections/' + coll.id + '/reviewers');
+      const scopes = data.data || [];
+      scopes.forEach(s => {
+        const tr = document.createElement('tr');
+        const user = state.users.find(u => u.id === s.user_id) || { username: s.user_id };
+        tr.innerHTML =
+          '<td>' + s.id + '</td>' +
+          '<td>' + (user?.username || s.user_id) + '</td>' +
+          '<td>' + (coll.name || coll.identifier) + ' (' + coll.id + ')</td>' +
+          '<td>' + s.match_field + '</td>' +
+          '<td>' + s.match_pattern + '</td>' +
+          '<td>' + (s.match_exact ? 'Yes' : 'No') + '</td>' +
+          '<td>' + (s.granted_at || '') + '</td>' +
+          '<td><button class="btn btn-sm btn-danger" onclick="removeScope(' + s.id + ')">Remove</button></td>';
+        tbody.appendChild(tr);
+      });
+    } catch (e) {
+      // skip
+    }
+  }
+}
+
+function openScopeModal() {
+  document.getElementById('scopeUserId').value = '';
+  document.getElementById('flashScopeError').classList.remove('show');
+  // Populate user dropdown
+  const userSelect = document.getElementById('scopeUserSelect');
+  userSelect.innerHTML = '';
+  state.users.forEach(u => {
+    const opt = document.createElement('option');
+    opt.value = u.id;
+    opt.textContent = u.username + ' (' + u.role + ')';
+    userSelect.appendChild(opt);
+  });
+  // Populate collection dropdown
+  const collSelect = document.getElementById('scopeCollSelect');
+  collSelect.innerHTML = '<option value="">Select a collection…</option>';
+  state.collections.forEach(c => {
+    const opt = document.createElement('option');
+    opt.value = c.id;
+    opt.textContent = (c.name || c.identifier) + ' (' + c.id + ')';
+    collSelect.appendChild(opt);
+  });
+  document.getElementById('scopeModal').style.display = 'block';
+}
+
+function closeScopeModal() {
+  document.getElementById('scopeModal').style.display = 'none';
+}
+
+async function saveScope() {
+  const userId = document.getElementById('scopeUserSelect').value;
+  const collId = document.getElementById('scopeCollSelect').value;
+  const field = document.getElementById('scopeField').value.trim();
+  const pattern = document.getElementById('scopePattern').value.trim();
+  const exact = document.getElementById('scopeExact').checked;
+  if (!userId || !collId || !field || !pattern) {
+    flash('All fields required', 'error', 'flashScopeError');
+    return;
+  }
+  try {
+    await api('/api/collections/' + collId + '/reviewers', {
+      method: 'POST',
+      body: JSON.stringify({ user_id: parseInt(userId), match_field: field, match_pattern: pattern, match_exact: exact })
+    });
+    flash('Reviewer scope added', 'success');
+    closeScopeModal();
+    await loadScopes();
+  } catch (e) {
+    flash(e.message, 'error', 'flashScopeError');
+  }
+}
+
+async function removeScope(scopeId) {
+  if (!confirm('Remove this reviewer scope?')) return;
+  try {
+    // Delete by iterating collections to find the scope
+    for (const coll of state.collections) {
+      try {
+        await api('/api/collections/' + coll.id + '/reviewers/' + scopeId, { method: 'DELETE' });
+      } catch(e) {}
+    }
+    flash('Reviewer scope removed', 'success');
+    await loadScopes();
+  } catch (e) {
+    flash(e.message, 'error');
+  }
+}
+
+async function logout() {
+  try { await api('/api/auth/logout', { method: 'POST' }); } catch(e) {}
+  window.location.href = '/login';
+}
+
+async function init() {
+  await loadMe();
+  await loadUsers();
+  await loadCollections();
+  await loadScopes();
+  // Show the currently active panel
+  switchPanel(state.currentPanel || 'users');
+}
+
+init();
+</script>
+</body>
+</html>

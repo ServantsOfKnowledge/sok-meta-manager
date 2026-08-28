@@ -478,6 +478,34 @@ CREATE INDEX IF NOT EXISTS idx_jobs_status    ON jobs(status);
 CREATE INDEX IF NOT EXISTS idx_jobs_collection ON jobs(collection_id);
 CREATE INDEX IF NOT EXISTS idx_sub_super       ON ia_sub_collections(super_id);
 CREATE INDEX IF NOT EXISTS idx_joblog_job      ON job_log(job_id);
+
+CREATE TABLE IF NOT EXISTS users (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    username    TEXT    UNIQUE NOT NULL,
+    password    TEXT    NOT NULL,
+    role        TEXT    NOT NULL DEFAULT 'viewer',
+    created_at  TEXT    DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS user_collection_permissions (
+    user_id        INTEGER  NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    collection_id  INTEGER  NOT NULL REFERENCES collections(id) ON DELETE CASCADE,
+    role           TEXT     NOT NULL DEFAULT 'viewer',
+    granted_at     TEXT     DEFAULT (datetime('now')),
+    UNIQUE(user_id, collection_id)
+);
+
+CREATE TABLE IF NOT EXISTS reviewer_scopes (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id       INTEGER  NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    collection_id INTEGER  NOT NULL REFERENCES collections(id) ON DELETE CASCADE,
+    name          TEXT,
+    match_field   TEXT    NOT NULL,
+    match_pattern TEXT    NOT NULL,
+    match_exact   INTEGER DEFAULT 0,
+    granted_at    TEXT    DEFAULT (datetime('now')),
+    UNIQUE(user_id, collection_id, match_field, match_pattern)
+);
 """
 
 
@@ -1100,6 +1128,7 @@ def list_items(collection_id, search=None, modified_only=False,
                ia_collection=None, ia_collection_not=None,
                date_published=None, date_archived=None, date_reviewed=None,
                creator=None,
+               reviewer_scopes=None,
                page=1, per_page=50, sort="title", sort_dir="asc"):
     conn = get_coll_db(collection_id)
     where, params = [], []
@@ -1130,6 +1159,21 @@ def list_items(collection_id, search=None, modified_only=False,
     if date_reviewed:
         where.append("i.date LIKE ?")
         params.append(date_reviewed + "%")
+    if reviewer_scopes:
+        # Build OR conditions for reviewer scope filtering — item must match
+        # at least one scope to be visible
+        or_parts = []
+        for scope in reviewer_scopes:
+            field = scope["match_field"]
+            pattern = scope["match_pattern"]
+            if scope.get("match_exact"):
+                or_parts.append(f"i.{field} = ?")
+                params.append(pattern)
+            else:
+                or_parts.append(f"LOWER(i.{field}) LIKE ?")
+                params.append("%" + pattern.lower() + "%")
+        if or_parts:
+            where.append("(" + " OR ".join(or_parts) + ")")
     allowed = {"title", "identifier", "creator", "author", "publisher",
                "date", "year", "last_modified", "last_synced",
                "detected_language", "rank", "relevance"}

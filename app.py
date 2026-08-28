@@ -6,16 +6,19 @@ v3: persistent background job queue, per-collection sharded databases,
     sync/operations status page, bulk collection membership, FTS search index
     and disk-cached collection logos.
 """
-import csv, io, json, os, re, threading, time
+import csv, io, json, os, re, threading, time, functools
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
-from flask import Flask, jsonify, request, render_template, send_file, Response
+from flask import (Flask, jsonify, request, render_template, send_file,
+                   Response, session, redirect, url_for, g, flash, abort)
 
 import database as db
 import ia_service as ia_svc
 import transliteration as T
+import auth_system
 
 app = Flask(__name__)
+app.secret_key = os.environ.get("FLASK_SECRET_KEY", os.urandom(32))
 
 # ── Sync mirror (in-memory, for legacy /sync/status + sidebar badges) ────────
 _sync_state: dict = {}   # {coll_id: {status, current, total, new_count, error, mode, since, job_id}}
@@ -32,6 +35,288 @@ def ok(data=None, **kw):
 
 def err(msg, code=400):
     return jsonify({"ok": False, "error": msg}), code
+
+
+# ── Authentication & Authorization ─────────────────────────────────────────────
+
+@app.before_request
+def load_logged_in_user():
+    """Load the current user from session into flask.g for every request."""
+    user_id = session.get("user_id")
+    if user_id:
+        g.user = auth_system.get_user_by_id(user_id)
+        if g.user is None:
+            session.clear()
+            g.user = None
+    else:
+        g.user = None
+
+
+def current_user():
+    """Return the current user dict or None."""
+    return getattr(g, "user", None)
+
+
+def login_required_api(f):
+    """Decorator for API routes — returns 401 JSON if not logged in."""
+    @functools.wraps(f)
+    def wrapped(*args, **kwargs):
+        if not current_user():
+            return err("Authentication required", 401)
+        return f(*args, **kwargs)
+    return wrapped
+
+
+def require_role(*roles):
+    """Decorator: require the current user to have one of the given global roles."""
+    def decorator(f):
+        @functools.wraps(f)
+        def wrapped(*args, **kwargs):
+            u = current_user()
+            if not u:
+                return err("Authentication required", 401)
+            if u["role"] not in roles:
+                return err("Insufficient permissions", 403)
+            return f(*args, **kwargs)
+        return wrapped
+    return decorator
+
+
+# ── Auth routes ─────────────────────────────────────────────────────────────────
+
+@app.route("/api/auth/login", methods=["POST"])
+def api_login():
+    body = request.get_json(silent=True) or {}
+    username = body.get("username", "").strip()
+    password = body.get("password", "")
+    if not username or not password:
+        return err("Username and password required")
+    user = auth_system.get_user_by_username(username)
+    if user and auth_system.verify_password(user["password"], password):
+        session["user_id"] = user["id"]
+        session["user_role"] = user["role"]
+        return ok({"id": user["id"], "username": user["username"], "role": user["role"]})
+    return err("Invalid username or password", 401)
+
+
+@app.route("/api/auth/logout", methods=["POST"])
+def api_logout():
+    session.clear()
+    return ok({"message": "Logged out"})
+
+
+@app.route("/api/auth/signup", methods=["POST"])
+def api_signup():
+    body = request.get_json(silent=True) or {}
+    username = body.get("username", "").strip()
+    password = body.get("password", "")
+    role = body.get("role", "viewer")
+    # Only admins can create other admins or editors; otherwise always viewer
+    if role not in ("viewer", "editor", "admin"):
+        return err("Invalid role")
+    u = current_user()
+    if role != "viewer":
+        if not u:
+            return err("Only an existing admin can create privileged accounts", 403)
+        if u["role"] != "admin":
+            role = "viewer"
+    if not username or not password or len(password) < 4:
+        return err("Username and password (min 4 chars) required")
+    try:
+        user_id = auth_system.create_user(username, password, role)
+    except ValueError:
+        return err("Username already exists", 409)
+    return ok({"id": user_id, "username": username, "role": role}), 201
+
+
+@app.route("/api/auth/me")
+def api_me():
+    u = current_user()
+    if u:
+        return ok({"id": u["id"], "username": u["username"], "role": u["role"]})
+    return ok({"authenticated": False})
+
+
+# ── User management API (admin only) ────────────────────────────────────────────
+
+@app.route("/api/users")
+@require_role("admin")
+def api_users():
+    users = auth_system.list_users()
+    # Attach collection IDs for each user for the admin dashboard
+    for u in users:
+        perms = auth_system.get_user_collection_permissions(u["id"])
+        u["collection_ids"] = list(perms.keys())
+    return ok(users)
+
+
+@app.route("/api/users/<int:user_id>", methods=["DELETE"])
+@require_role("admin")
+def api_delete_user(user_id):
+    if current_user()["id"] == user_id:
+        return err("Cannot delete your own account")
+    deleted = auth_system.delete_user(user_id)
+    return ok({"deleted": deleted})
+
+
+@app.route("/api/users/<int:user_id>/role", methods=["PUT"])
+@require_role("admin")
+def api_update_user_role(user_id):
+    body = request.get_json(silent=True) or {}
+    new_role = body.get("role", "").strip()
+    if new_role not in auth_system.ROLE_HIERARCHY:
+        return err("Invalid role")
+    if user_id == current_user()["id"]:
+        return err("Cannot change your own role")
+    updated = auth_system.update_user_role(user_id, new_role)
+    return ok({"updated": updated})
+
+
+@app.route("/api/users/<int:user_id>/password", methods=["PUT"])
+@require_role("admin")
+def api_update_user_password(user_id):
+    body = request.get_json(silent=True) or {}
+    password = body.get("password", "")
+    if len(password) < 4:
+        return err("Password must be at least 4 characters")
+    updated = auth_system.update_user_password(user_id, password)
+    return ok({"updated": updated})
+
+
+# ── Collection-level permissions API (admin only) ───────────────────────────────
+
+@app.route("/api/collections/<int:coll_id>/permissions")
+@require_role("admin")
+def api_collection_permissions(coll_id):
+    """List all users with explicit collection access + their roles."""
+    return ok(auth_system.list_collection_users(coll_id))
+
+
+@app.route("/api/collections/<int:coll_id>/permissions", methods=["POST"])
+@require_role("admin")
+def api_grant_collection_access(coll_id):
+    """Grant a user collection-level access. Body: {user_id, role}."""
+    body = request.get_json(silent=True) or {}
+    user_id = body.get("user_id")
+    role = (body.get("role") or "viewer").strip()
+    if not user_id:
+        return err("user_id required")
+    if role not in auth_system.ROLE_HIERARCHY:
+        return err("Invalid role")
+    auth_system.grant_collection_access(int(user_id), coll_id, role)
+    return ok({"granted": True})
+
+
+@app.route("/api/collections/<int:coll_id>/permissions/<int:user_id>", methods=["DELETE"])
+@require_role("admin")
+def api_revoke_collection_access(coll_id, user_id):
+    auth_system.revoke_collection_access(user_id, coll_id)
+    return ok({"revoked": True})
+
+
+# ── Reviewer scopes: search-pattern-based item access ───────────────────────────
+
+@app.route("/api/collections/<int:coll_id>/reviewers")
+@require_role("admin")
+def api_collection_reviewers(coll_id):
+    """List all reviewer scopes for a collection."""
+    return ok(auth_system.list_reviewer_scopes_for_collection(coll_id))
+
+
+@app.route("/api/collections/<int:coll_id>/reviewers", methods=["POST"])
+@require_role("admin")
+def api_add_reviewer_scope(coll_id):
+    """Add a reviewer scope — restricts a user to items matching a field+pattern.
+    Body: {user_id, match_field, match_pattern, match_exact?, name?}"""
+    body = request.get_json(silent=True) or {}
+    user_id = body.get("user_id")
+    field = (body.get("match_field") or "").strip()
+    pattern = (body.get("match_pattern") or "").strip()
+    exact = bool(body.get("match_exact", False))
+    name = (body.get("name") or "").strip()
+    if not user_id:
+        return err("user_id required")
+    if not field or not pattern:
+        return err("match_field and match_pattern required")
+    scope_id = auth_system.add_reviewer_scope(int(user_id), coll_id, field, pattern, exact, name)
+    return ok({"scope_id": scope_id}), 201
+
+
+@app.route("/api/collections/<int:coll_id>/reviewers/<int:scope_id>", methods=["DELETE"])
+@require_role("admin")
+def api_remove_reviewer_scope(coll_id, scope_id):
+    auth_system.remove_reviewer_scope(scope_id)
+    return ok({"removed": True})
+
+
+@app.route("/api/users/<int:user_id>/reviewers")
+@require_role("admin")
+def api_user_reviewer_scopes(user_id):
+    """List all reviewer scopes for a user across all collections."""
+    return ok(auth_system.list_reviewer_scopes_for_user(user_id))
+
+
+# ── Auth-protected views ────────────────────────────────────────────────────────
+
+@app.route("/login")
+def login_page():
+    if current_user():
+        return redirect(url_for("index"))
+    if request.accept_mimetypes.accept_html:
+        return render_template("auth/login.html")
+    return redirect(url_for("api_login"))
+
+
+@app.route("/signup")
+def signup_page():
+    if current_user():
+        return redirect(url_for("index"))
+    if request.accept_mimetypes.accept_html:
+        return render_template("auth/signup.html")
+    return redirect(url_for("api_signup"))
+
+
+@app.route("/admin")
+@require_role("admin")
+def admin_page():
+    if request.accept_mimetypes.accept_html:
+        return render_template("admin.html")
+    return ok({"admin": True})
+
+
+# ── Middleware: protect API routes ──────────────────────────────────────────────
+
+# Public routes that do not require authentication
+_PUBLIC_ROUTES = {
+    "/api/auth/login", "/api/auth/logout", "/api/auth/signup", "/api/auth/me",
+    "/api/ia-status", "/api/health", "/api/stats/impact",
+}
+
+# Routes that require admin role
+_ADMIN_ROUTES_PREFIXES = ("/api/users", "/api/collections")
+
+
+@app.before_request
+def auth_middleware():
+    """Protect API routes — all /api/* endpoints require authentication,
+    except auth endpoints and health/status endpoints.
+    Route-level @require_role decorators handle admin checks."""
+    path = request.path
+    if not path.startswith("/api/"):
+        # Non-API routes are handled by individual decorators
+        return
+    if path in _PUBLIC_ROUTES:
+        return
+    if path.startswith("/api/auth/"):
+        return
+    u = current_user()
+    if not u:
+        return err("Authentication required", 401)
+    # Admin-only routes
+    if path.startswith("/api/users"):
+        if u["role"] != "admin":
+            return err("Admin access required", 403)
+    return
 
 
 # ── Background job worker ─────────────────────────────────────────────────────
@@ -914,16 +1199,49 @@ def api_vacuum(coll_id):
 
 # ── Items ─────────────────────────────────────────────────────────────────────
 
+def _check_item_access(item, require_edit=False):
+    """Check if the current user has access to this item.
+    Returns the item if access is allowed, or raises an error response."""
+    u = current_user()
+    if not u:
+        return None  # Caller should have checked auth already
+    if u["role"] == "admin":
+        return item
+    coll_id = item.get("collection_id") or db._coll_id_from_item_id(item["id"])
+    # Check if user has access to this collection at all
+    if not auth_system.has_collection_access(u["id"], coll_id, "viewer"):
+        return None
+    if require_edit:
+        if not auth_system.can_edit_item(u["id"], coll_id, item):
+            return None
+    else:
+        if not auth_system.has_item_access(u["id"], coll_id, item):
+            return None
+    return item
+
+
 @app.route("/api/collections/<int:coll_id>/items")
 def api_list_items(coll_id):
+    u = current_user()
+    # Non-admin users need collection access
+    if u and u["role"] != "admin":
+        if not auth_system.has_collection_access(u["id"], coll_id, "viewer"):
+            return err("Access denied to this collection", 403)
+
+    # Get reviewer scopes for filtering
+    scopes = None
+    if u and u["role"] != "admin":
+        scopes = auth_system.get_reviewer_scopes(u["id"], coll_id)
+
     result = db.list_items(
         coll_id,
         search          = request.args.get("q", ""),
-        modified_only   = request.args.get("modified_only", "false").lower() == "true",
+        modified_only   = request.args.get("modified_only", "False").lower() == "true",
         lang_code       = request.args.get("lang") or None,
         translit_status = request.args.get("tstatus") or None,
         ia_collection   = request.args.get("ia_collection") or None,
         ia_collection_not = request.args.get("ia_collection_not") or None,
+        reviewer_scopes = scopes,
         page            = int(request.args.get("page", 1)),
         per_page        = int(request.args.get("per_page", 50)),
         sort            = request.args.get("sort", "title"),
@@ -934,10 +1252,23 @@ def api_list_items(coll_id):
 @app.route("/api/items/<int:item_id>")
 def api_get_item(item_id):
     item = db.get_item(item_id)
-    return ok(item) if item else err("Item not found", 404)
+    if not item:
+        return err("Item not found", 404)
+    u = current_user()
+    if u and u["role"] != "admin":
+        if _check_item_access(item, require_edit=False) is None:
+            return err("Access denied", 403)
+    return ok(item)
 
 @app.route("/api/items/<int:item_id>", methods=["PATCH"])
 def api_update_item(item_id):
+    item = db.get_item(item_id)
+    if not item:
+        return err("Item not found", 404)
+    u = current_user()
+    if u and u["role"] != "admin":
+        if _check_item_access(item, require_edit=True) is None:
+            return err("Access denied — you cannot edit this item", 403)
     body = request.get_json(silent=True) or {}
     if not body:
         return err("No fields provided")
@@ -1142,13 +1473,27 @@ PUSHABLE = [
 
 @app.route("/api/collections/<int:coll_id>/pending-push")
 def api_pending_push(coll_id):
-    return ok(db.get_modified_items(coll_id))
+    u = current_user()
+    if u and u["role"] != "admin":
+        if not auth_system.has_collection_access(u["id"], coll_id, "viewer"):
+            return err("Access denied to this collection", 403)
+    items = db.get_modified_items(coll_id)
+    # Filter by reviewer scopes
+    if u and u["role"] != "admin":
+        scopes = auth_system.get_reviewer_scopes(u["id"], coll_id)
+        if scopes:
+            items = [i for i in items if auth_system.has_item_access(u["id"], coll_id, i)]
+    return ok(items)
 
 @app.route("/api/items/<int:item_id>/push", methods=["POST"])
 def api_push_item(item_id):
     item = db.get_item(item_id)
     if not item:
         return err("Item not found", 404)
+    u = current_user()
+    if u and u["role"] != "admin":
+        if _check_item_access(item, require_edit=True) is None:
+            return err("Access denied — you cannot push this item", 403)
     push_fields = {f: item[f] for f in PUSHABLE if item.get(f)}
     result = ia_svc.push_metadata_to_ia(item["identifier"], push_fields)
     if result["success"]:
@@ -1160,10 +1505,19 @@ def api_push_all(coll_id):
     coll = db.get_collection(coll_id)
     if not coll:
         return err("Collection not found", 404)
-    items   = db.get_modified_items(coll_id)
+    u = current_user()
+    if u and u["role"] != "admin":
+        if not auth_system.has_collection_access(u["id"], coll_id, "editor"):
+            return err("Editor access required for this collection", 403)
+    items = db.get_modified_items(coll_id)
+    # Reviewers can only push items they have access to
+    if u and u["role"] != "admin":
+        scopes = auth_system.get_reviewer_scopes(u["id"], coll_id)
+        if scopes:
+            items = [i for i in items if auth_system.can_edit_item(u["id"], coll_id, i)]
     pending = [i for i in items if not i.get("is_pushed")]
-    job_id  = db.create_job("push-all", coll_id, {},
-                            title=f"Push {len(pending)} item(s) to IA · {coll['name']}")
+    job_id = db.create_job("push-all", coll_id, {},
+                           title=f"Push {len(pending)} item(s) to IA · {coll['name']}")
     return ok({"job_id": job_id, "pending": len(pending)}), 202
 
 
@@ -1526,6 +1880,8 @@ def api_health():
 
 @app.route("/")
 def index():
+    if not current_user():
+        return redirect(url_for("login_page"))
     return render_template("index.html")
 
 
