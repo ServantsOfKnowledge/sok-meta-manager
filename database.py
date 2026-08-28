@@ -1396,6 +1396,7 @@ def get_collection_names(collection_id, min_count=2, limit=500):
         rows = conn.execute(
             "SELECT collection AS name, COUNT(DISTINCT item_id) AS count "
             "FROM item_collections "
+            "WHERE collection NOT LIKE 'fav-%' "
             "GROUP BY collection HAVING COUNT(DISTINCT item_id)>=? "
             "ORDER BY count DESC, name LIMIT ?",
             (min_count, limit),
@@ -1560,21 +1561,36 @@ def _impact_accumulate(rows):
             heapq.heappop(heap)
 
     for ident, title, lang, dl, v30, v7, ic, mod, push in rows:
+        def _to_int(v):
+            """Safely convert a DB value to int, handling strings like '4 | 30'."""
+            if v is None:
+                return 0
+            try:
+                return int(v)
+            except (ValueError, TypeError):
+                try:
+                    # Handle values like "4 | 30" — take the first number
+                    first = str(v).strip().split("|")[0].strip()
+                    return int(float(first))
+                except (ValueError, TypeError):
+                    return 0
+
+        i_dl, i_v30, i_v7, i_ic = _to_int(dl), _to_int(v30), _to_int(v7), _to_int(ic)
         items += 1
-        if dl or lang or ic or v30 or v7:
+        if i_dl or lang or i_ic or i_v30 or i_v7:
             r = {"identifier": ident, "title": title, "lang": lang,
-                 "downloads": dl or 0, "views_30d": v30 or 0,
-                 "views_7d": v7 or 0, "imagecount": ic or 0}
-            if dl:
-                downloads += dl
+                 "downloads": i_dl, "views_30d": i_v30,
+                 "views_7d": i_v7, "imagecount": i_ic}
+            if i_dl:
+                downloads += i_dl
                 _push_top(top_dl, r, "downloads", seq)
-            if v30:
-                views_30d += v30
+            if i_v30:
+                views_30d += i_v30
                 _push_top(top_views, r, "views_30d", seq)
-            if v7:
-                views_7d += v7
-            if ic:
-                pages += ic
+            if i_v7:
+                views_7d += i_v7
+            if i_ic:
+                pages += i_ic
                 pages_items += 1
             if lang:
                 langs[lang] = langs.get(lang, 0) + 1

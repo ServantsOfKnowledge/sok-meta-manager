@@ -973,6 +973,8 @@ def api_stats_impact():
             for n in db.get_collection_names(m["id"], min_count=5, limit=400):
                 if n["name"].lower() in main_names:
                     continue  # the main collection itself shows as a member
+                if n["name"].lower().startswith("fav-"):
+                    continue  # skip fav-* collections (favorites are not real collections)
                 subs.append({"name": n["name"], "count": n["count"],
                              "coll_id": m["id"], "main": m["name"]})
         return ok({"main": mains, "sub": subs})

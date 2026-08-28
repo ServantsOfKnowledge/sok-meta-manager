@@ -490,14 +490,14 @@ def fetch_sub_collections(collection_identifier: str) -> list:
             for result in search:
                 ia_id = result.get("identifier", "").strip()
                 name  = result.get("title") or ia_id
-                if ia_id and ia_id != collection_identifier:
+                if ia_id and ia_id != collection_identifier and not ia_id.lower().startswith("fav-"):
                     results.append({"ia_id": ia_id, "name": _coerce(name)})
             return results
 
         for item in data.get("items", []):
             ia_id = item.get("identifier", "").strip()
             name  = item.get("title") or ia_id
-            if ia_id and ia_id != collection_identifier:
+            if ia_id and ia_id != collection_identifier and not ia_id.lower().startswith("fav-"):
                 results.append({"ia_id": ia_id, "name": _coerce(name)})
 
         cursor = data.get("cursor")
