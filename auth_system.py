@@ -9,6 +9,7 @@ Roles:
 """
 import os
 import sys
+import re
 import hashlib
 import hmac
 import json
@@ -50,6 +51,25 @@ def verify_password(stored: str, provided: str) -> bool:
 # ── Role hierarchy ────────────────────────────────────────────────────────────────
 
 ROLE_HIERARCHY = {"viewer": 0, "editor": 1, "admin": 2}
+
+# ── Password strength validation ──────────────────────────────────────────────
+
+_PASSWORD_MIN_LENGTH = 8
+
+def validate_password_strength(password: str) -> str | None:
+    """Validate password meets strength requirements.
+    Returns None if valid, or an error message string."""
+    if len(password) < _PASSWORD_MIN_LENGTH:
+        return f"Password must be at least {_PASSWORD_MIN_LENGTH} characters"
+    if not re.search(r"[A-Z]", password):
+        return "Password must contain at least one uppercase letter"
+    if not re.search(r"[a-z]", password):
+        return "Password must contain at least one lowercase letter"
+    if not re.search(r"\d", password):
+        return "Password must contain at least one digit"
+    if not re.search(r"[!@#$%^&*()_+\-=\[\]{};':\"\\|,.<>\/?`~]", password):
+        return "Password must contain at least one special character (!@#$%^&* etc.)"
+    return None
 
 def role_at_least(user_role: str, required: str) -> bool:
     """Check if user_role meets or exceeds required role."""
@@ -244,16 +264,17 @@ def has_collection_access(user_id: int, coll_id: int, min_role: str = "viewer") 
 
 def get_reviewer_scopes(user_id: int, coll_id: int):
     """Return a list of reviewer scopes (search patterns) for a user on a collection.
-    Each scope is a dict: {match_field, match_pattern, match_exact}."""
+    Each scope is a dict: {match_field, match_pattern, match_exact, ia_collection}."""
     conn = _get_db()
     try:
         rows = conn.execute(
-            "SELECT match_field, match_pattern, match_exact FROM reviewer_scopes "
+            "SELECT match_field, match_pattern, match_exact, ia_collection FROM reviewer_scopes "
             "WHERE user_id = ? AND collection_id = ?",
             (user_id, coll_id),
         ).fetchall()
         return [{"match_field": r["match_field"], "match_pattern": r["match_pattern"],
-                 "match_exact": bool(r["match_exact"])} for r in rows]
+                 "match_exact": bool(r["match_exact"]),
+                 "ia_collection": r["ia_collection"]} for r in rows]
     finally:
         conn.close()
 
@@ -294,17 +315,27 @@ def has_item_access(user_id: int, coll_id: int, item: dict) -> bool:
 
 
 def _matches_any_scope(scopes, item):
-    """Check if an item matches at least one reviewer scope."""
+    """Check if an item matches at least one reviewer scope.
+    If a scope has ia_collection set, the item must also belong to that sub-collection."""
     for scope in scopes:
         field = scope["match_field"]
         pattern = scope["match_pattern"]
         val = (item.get(field) or "").strip()
         if scope["match_exact"]:
-            if val == pattern:
-                return True
+            if val != pattern:
+                continue
         else:
-            if pattern.lower() in val.lower():
-                return True
+            if pattern.lower() not in val.lower():
+                continue
+        # If scope is restricted to a sub-collection, check item belongs to it
+        ia_col = scope.get("ia_collection")
+        if ia_col:
+            item_cols = item.get("collections") or ""
+            if isinstance(item_cols, str):
+                item_cols = [c.strip() for c in item_cols.split("||") if c.strip()]
+            if ia_col not in item_cols:
+                continue
+        return True
     return False
 
 
@@ -343,14 +374,14 @@ def can_edit_item(user_id: int, coll_id: int, item: dict) -> bool:
 # ── Reviewer scope management ───────────────────────────────────────────────────
 
 def add_reviewer_scope(user_id: int, coll_id: int, field: str, pattern: str,
-                       exact: bool = False, name: str = "") -> int:
+                       exact: bool = False, name: str = "", ia_collection: str = None) -> int:
     """Add a reviewer scope for a user on a collection."""
     conn = _get_db()
     try:
         cur = conn.execute(
-            "INSERT INTO reviewer_scopes (user_id, collection_id, match_field, match_pattern, match_exact, name) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (user_id, coll_id, field, pattern, 1 if exact else 0, name),
+            "INSERT INTO reviewer_scopes (user_id, collection_id, match_field, match_pattern, match_exact, name, ia_collection) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (user_id, coll_id, field, pattern, 1 if exact else 0, name, ia_collection),
         )
         conn.commit()
         return cur.lastrowid
@@ -372,7 +403,7 @@ def list_reviewer_scopes_for_user(user_id: int):
     try:
         rows = conn.execute(
             "SELECT rs.id, rs.collection_id, c.name as collection_name, c.identifier, "
-            "rs.match_field, rs.match_pattern, rs.match_exact, rs.name, rs.granted_at "
+            "rs.match_field, rs.match_pattern, rs.match_exact, rs.name, rs.ia_collection, rs.granted_at "
             "FROM reviewer_scopes rs "
             "JOIN collections c ON c.id = rs.collection_id "
             "WHERE rs.user_id = ? ORDER BY rs.granted_at DESC",
@@ -387,7 +418,8 @@ def list_reviewer_scopes_for_collection(coll_id: int):
     conn = _get_db()
     try:
         rows = conn.execute(
-            "SELECT rs.id, rs.user_id, u.username, rs.match_field, rs.match_pattern, rs.match_exact, rs.name, rs.granted_at "
+            "SELECT rs.id, rs.user_id, u.username, rs.match_field, rs.match_pattern, "
+            "rs.match_exact, rs.name, rs.ia_collection, rs.granted_at "
             "FROM reviewer_scopes rs "
             "JOIN users u ON u.id = rs.user_id "
             "WHERE rs.collection_id = ? ORDER BY rs.granted_at DESC",

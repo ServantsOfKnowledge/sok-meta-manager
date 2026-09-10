@@ -84,7 +84,10 @@
 <div id="app">
   <div id="topbar">
     <div class="left">
-      <span class="logo">🕉 SOK</span>
+      <a href="/" style="display:flex;align-items:center;gap:10px;text-decoration:none;">
+        <img src="/static/img/logo-64.png" alt="SOK" style="width:34px;height:34px;border-radius:50%;">
+        <span class="logo" style="color:var(--gold-dim);">SOK</span>
+      </a>
       <nav class="nav">
         <a href="/" id="nav-home">MetaManager</a>
         <a href="/admin" class="active" id="nav-admin">Admin</a>
@@ -145,7 +148,7 @@
         <table id="scopesTable">
           <thead>
             <tr>
-              <th>ID</th><th>User</th><th>Collection</th><th>Field</th><th>Pattern</th><th>Exact?</th><th>Created</th><th>Actions</th>
+              <th>ID</th><th>User</th><th>Collection</th><th>Sub-Collection</th><th>Field</th><th>Pattern</th><th>Exact?</th><th>Created</th><th>Actions</th>
             </tr>
           </thead>
           <tbody></tbody>
@@ -166,7 +169,10 @@
       </div>
       <div class="form-row">
         <label>Password</label>
-        <input class="input" type="password" id="newPassword" placeholder="min 4 characters">
+        <input class="input" type="password" id="newPassword" placeholder="Enter strong password">
+        <div style="font-size:11px;color:var(--text3);margin-top:4px;">
+          Min 8 chars: uppercase, lowercase, digit, and special character (!@#$%^&*)
+        </div>
       </div>
       <div class="form-row">
         <label>Role</label>
@@ -176,6 +182,7 @@
           <option value="admin">Admin (full access)</option>
         </select>
       </div>
+      <div class="flash error" id="flashSignupError"></div>
       <div class="actions">
         <button class="btn" onclick="closeSignupModal()">Cancel</button>
         <button class="btn btn-primary" onclick="createUser()">Create</button>
@@ -220,8 +227,14 @@
       </div>
       <div class="form-row">
         <label>Collection</label>
-        <select class="input" id="scopeCollSelect">
+        <select class="input" id="scopeCollSelect" onchange="loadSubCollections()">
           <option value="">Select a collection…</option>
+        </select>
+      </div>
+      <div class="form-row">
+        <label>Sub-Collection (optional)</label>
+        <select class="input" id="scopeSubCollSelect">
+          <option value="">All items in collection</option>
         </select>
       </div>
       <div class="form-row">
@@ -247,15 +260,14 @@
 <div id="passwordModal" style="display:none;">
   <div class="modal-overlay" onclick="closePasswordModal()">
     <div class="modal" onclick="event.stopPropagation()">
-      <h2>Change Your Password</h2>
+      <h2>Change Password for <span id="pwTargetUser"></span></h2>
       <input type="hidden" id="pwUserId">
       <div class="form-row">
-        <label>Current Password</label>
-        <input class="input" type="password" id="pwCurrent" placeholder="current password">
-      </div>
-      <div class="form-row">
         <label>New Password</label>
-        <input class="input" type="password" id="pwNew" placeholder="min 4 characters">
+        <input class="input" type="password" id="pwNew" placeholder="Enter strong password">
+        <div style="font-size:11px;color:var(--text3);margin-top:4px;">
+          Min 8 chars: uppercase, lowercase, digit, and special character (!@#$%^&*)
+        </div>
       </div>
       <div class="flash error" id="flashPwError"></div>
       <div class="actions">
@@ -354,8 +366,9 @@ function renderUsers() {
       '<td>' + collCount + ' collection(s)</td>' +
       '<td>' + (u.created_at || '') + '</td>' +
       '<td>' +
+      '<button class="btn btn-sm" onclick="openPasswordModalForUser(' + u.id + ', \'' + u.username + '\')">Change Password</button> ' +
       (u.role === 'admin' ? '' :
-        '<button class="btn btn-sm" onclick="openRoleModal(' + u.id + ')">Change Role</button>') +
+        '<button class="btn btn-sm" onclick="openRoleModal(' + u.id + ')">Change Role</button> ') +
       (state.user && u.id === state.user.id ? '' :
         '<button class="btn btn-sm btn-danger" onclick="deleteUser(' + u.id + ', \'' + u.username + '\')">Delete</button>') +
       '</td>';
@@ -458,7 +471,15 @@ function closeRoleModal() {
 
 function openPasswordModal() {
   document.getElementById('pwUserId').value = state.user?.id || '';
-  document.getElementById('pwCurrent').value = '';
+  document.getElementById('pwTargetUser').textContent = state.user?.username || '';
+  document.getElementById('pwNew').value = '';
+  document.getElementById('flashPwError').classList.remove('show');
+  document.getElementById('passwordModal').style.display = 'block';
+}
+
+function openPasswordModalForUser(userId, username) {
+  document.getElementById('pwUserId').value = userId;
+  document.getElementById('pwTargetUser').textContent = username;
   document.getElementById('pwNew').value = '';
   document.getElementById('flashPwError').classList.remove('show');
   document.getElementById('passwordModal').style.display = 'block';
@@ -469,17 +490,14 @@ function closePasswordModal() {
 }
 
 async function savePassword() {
-  const current = document.getElementById('pwCurrent').value;
+  const userId = document.getElementById('pwUserId').value;
   const newpass = document.getElementById('pwNew').value;
-  if (!current || !newpass || newpass.length < 4) {
-    flash('Current password and new password (min 4 chars) required', 'error', 'flashPwError');
+  if (!newpass) {
+    flash('New password is required', 'error', 'flashPwError');
     return;
   }
   try {
-    // We need to verify the current password first — use a dedicated endpoint or
-    // try updating. Since the API endpoint requires admin and updates by userId,
-    // we'll let the admin change their own password.
-    const resp = await fetch('/api/users/' + state.user.id + '/password', {
+    const resp = await fetch('/api/users/' + userId + '/password', {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ password: newpass })
@@ -500,8 +518,8 @@ async function createUser() {
   const username = document.getElementById('newUsername').value.trim();
   const password = document.getElementById('newPassword').value;
   const role = document.getElementById('newRole').value;
-  if (!username || !password || password.length < 4) {
-    flash('Username and password (min 4 chars) required', 'error');
+  if (!username || !password) {
+    flash('Username and password are required', 'error', 'flashSignupError');
     return;
   }
   try {
@@ -556,6 +574,7 @@ async function loadScopes() {
           '<td>' + s.id + '</td>' +
           '<td>' + (user?.username || s.user_id) + '</td>' +
           '<td>' + (coll.name || coll.identifier) + ' (' + coll.id + ')</td>' +
+          '<td>' + (s.ia_collection || '<span style="color:var(--text3)">All</span>') + '</td>' +
           '<td>' + s.match_field + '</td>' +
           '<td>' + s.match_pattern + '</td>' +
           '<td>' + (s.match_exact ? 'Yes' : 'No') + '</td>' +
@@ -590,6 +609,12 @@ function openScopeModal() {
     opt.textContent = (c.name || c.identifier) + ' (' + c.id + ')';
     collSelect.appendChild(opt);
   });
+  // Reset sub-collection dropdown
+  document.getElementById('scopeSubCollSelect').innerHTML =
+    '<option value="">All items in collection</option>';
+  document.getElementById('scopeField').value = '';
+  document.getElementById('scopePattern').value = '';
+  document.getElementById('scopeExact').checked = false;
   document.getElementById('scopeModal').style.display = 'block';
 }
 
@@ -597,9 +622,33 @@ function closeScopeModal() {
   document.getElementById('scopeModal').style.display = 'none';
 }
 
+async function loadSubCollections() {
+  const collId = document.getElementById('scopeCollSelect').value;
+  const subSelect = document.getElementById('scopeSubCollSelect');
+  subSelect.innerHTML = '<option value="">All items in collection</option>';
+  if (!collId) return;
+  try {
+    const r = await api('/api/collections/tree');
+    if (r.ok) {
+      const coll = r.data.find(c => c.id === parseInt(collId));
+      if (coll && coll.sub_collections) {
+        coll.sub_collections.forEach(sub => {
+          const opt = document.createElement('option');
+          opt.value = sub.ia_id;
+          opt.textContent = (sub.name || sub.ia_id) + ' (' + (sub.local_count || 0) + ')';
+          subSelect.appendChild(opt);
+        });
+      }
+    }
+  } catch (e) {
+    // ignore
+  }
+}
+
 async function saveScope() {
   const userId = document.getElementById('scopeUserSelect').value;
   const collId = document.getElementById('scopeCollSelect').value;
+  const iaCollection = document.getElementById('scopeSubCollSelect').value || null;
   const field = document.getElementById('scopeField').value.trim();
   const pattern = document.getElementById('scopePattern').value.trim();
   const exact = document.getElementById('scopeExact').checked;
@@ -610,7 +659,7 @@ async function saveScope() {
   try {
     await api('/api/collections/' + collId + '/reviewers', {
       method: 'POST',
-      body: JSON.stringify({ user_id: parseInt(userId), match_field: field, match_pattern: pattern, match_exact: exact })
+      body: JSON.stringify({ user_id: parseInt(userId), match_field: field, match_pattern: pattern, match_exact: exact, ia_collection: iaCollection })
     });
     flash('Reviewer scope added', 'success');
     closeScopeModal();

@@ -570,6 +570,7 @@ th.sorted .th-sort{opacity:1;}
         <option value="100">100/page</option>
       </select>
       <button class="btn btn-ghost btn-sm" onclick="clearFilters()">Clear</button>
+      <button class="btn btn-ghost btn-sm" onclick="exportSearchCSV()" title="Download all matching items as CSV">⬇ Export CSV</button>
     </div>
 
     <!-- Active filter chips -->
@@ -605,6 +606,7 @@ th.sorted .th-sort{opacity:1;}
               <th class="sortable" onclick="setSort('identifier')" id="th-identifier">Identifier <span class="th-sort">↕</span></th>
               <th class="sortable" onclick="setSort('creator')" id="th-creator">Creator <span class="th-sort">↕</span></th>
               <th class="sortable" onclick="setSort('year')" id="th-year" style="width:58px">Year <span class="th-sort">↕</span></th>
+              <th class="sortable" onclick="setSort('publisher')" id="th-publisher">Publisher <span class="th-sort">↕</span></th>
               <th style="width:78px">Language</th>
               <th style="width:88px">Translit</th>
               <th style="width:56px">Status</th>
@@ -1052,7 +1054,8 @@ function renderSidebar() {
     const subItems = (c.sub_collections || []).map(sub => {
       const subActive = isActive && S.activeIaColl === sub.ia_id;
       return `<div class="sub-item ${subActive?'active':''}"
-                   onclick="selectSubCollectionById(${c.id}, ${sub.id})"
+                   data-super="${c.id}" data-ia="${esc(sub.ia_id)}"
+                   onclick="selectSubCollectionById(+this.dataset.super, this.dataset.ia)"
                    title="${esc(sub.ia_id)}">
         <span>📁</span>
         <span class="si-name">${esc(sub.name||sub.ia_id)}</span>
@@ -1204,10 +1207,10 @@ function selectSubCollection(superColl, iaId, name) {
   if (cf) cf.value = iaId;
 }
 
-function selectSubCollectionById(superId, subId) {
+function selectSubCollectionById(superId, iaId) {
   const superColl = S.collTree.find(c=>c.id===superId);
   if (!superColl) return;
-  const sub = (superColl.sub_collections||[]).find(s=>s.id===subId);
+  const sub = (superColl.sub_collections||[]).find(s=>s.ia_id===iaId);
   if (!sub) return;
   selectSubCollection(superColl, sub.ia_id, sub.name);
 }
@@ -1572,6 +1575,7 @@ function renderItems() {
       </td>
       <td class="cell-creator text-clamp">${esc(item.creator||item.author||'—')}</td>
       <td>${esc(item.year||'')}</td>
+      <td class="text-clamp" style="max-width:120px">${esc(item.publisher||'')}</td>
       <td>${item.detected_language ? `<span class="chip ${INDIAN_CODES.has(item.detected_language)?'indian':''}">${esc(item.detected_language)}</span>` : ''}</td>
       <td><span class="badge badge-${item.translit_status||'none'}">${item.translit_status||'none'}</span></td>
       <td>${item.is_modified ? `<span class="badge badge-modified">edited</span>` : (item.is_pushed ? `<span class="badge badge-pushed">pushed</span>` : '')}</td>
@@ -1746,6 +1750,21 @@ async function applyCollFilter() {
   loadItems(false);
   loadLanguages();
   updateCollMeta();
+}
+
+function exportSearchCSV() {
+  if (!S.activeColl) return;
+  const q    = document.getElementById('search-input').value;
+  const lang = document.getElementById('lang-filter').value;
+  const ts   = document.getElementById('tstatus-filter').value;
+  const notColl = document.getElementById('not-col-filter').value.trim();
+  const paramObj = { q, lang, tstatus: ts, sort: S.sort, sort_dir: S.sortDir };
+  if (S.activeIaColl) paramObj.ia_collection = S.activeIaColl;
+  if (notColl) paramObj.ia_collection_not = notColl;
+  if (isModifiedTab()) paramObj.modified_only = 'true';
+  const params = new URLSearchParams(paramObj);
+  window.location.href = `/api/collections/${S.activeColl.id}/export?${params}`;
+  toast('Downloading CSV…', 'info');
 }
 
 function buildExportLangSelect() {

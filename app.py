@@ -120,8 +120,11 @@ def api_signup():
             return err("Only an existing admin can create privileged accounts", 403)
         if u["role"] != "admin":
             role = "viewer"
-    if not username or not password or len(password) < 4:
-        return err("Username and password (min 4 chars) required")
+    if not username or not password:
+        return err("Username and password are required")
+    pw_err = auth_system.validate_password_strength(password)
+    if pw_err:
+        return err(pw_err)
     try:
         user_id = auth_system.create_user(username, password, role)
     except ValueError:
@@ -177,8 +180,11 @@ def api_update_user_role(user_id):
 def api_update_user_password(user_id):
     body = request.get_json(silent=True) or {}
     password = body.get("password", "")
-    if len(password) < 4:
-        return err("Password must be at least 4 characters")
+    if not password:
+        return err("Password is required")
+    pw_err = auth_system.validate_password_strength(password)
+    if pw_err:
+        return err(pw_err)
     updated = auth_system.update_user_password(user_id, password)
     return ok({"updated": updated})
 
@@ -227,18 +233,19 @@ def api_collection_reviewers(coll_id):
 @require_role("admin")
 def api_add_reviewer_scope(coll_id):
     """Add a reviewer scope — restricts a user to items matching a field+pattern.
-    Body: {user_id, match_field, match_pattern, match_exact?, name?}"""
+    Body: {user_id, match_field, match_pattern, match_exact?, name?, ia_collection?}"""
     body = request.get_json(silent=True) or {}
     user_id = body.get("user_id")
     field = (body.get("match_field") or "").strip()
     pattern = (body.get("match_pattern") or "").strip()
     exact = bool(body.get("match_exact", False))
     name = (body.get("name") or "").strip()
+    ia_collection = (body.get("ia_collection") or "").strip() or None
     if not user_id:
         return err("user_id required")
     if not field or not pattern:
         return err("match_field and match_pattern required")
-    scope_id = auth_system.add_reviewer_scope(int(user_id), coll_id, field, pattern, exact, name)
+    scope_id = auth_system.add_reviewer_scope(int(user_id), coll_id, field, pattern, exact, name, ia_collection)
     return ok({"scope_id": scope_id}), 201
 
 
@@ -1731,6 +1738,69 @@ def api_review_export(coll_id):
         mimetype="text/csv",
         as_attachment=True,
         download_name=fname
+    )
+
+
+@app.route("/api/collections/<int:coll_id>/export")
+def api_export_csv(coll_id):
+    """Export all items matching current filters as CSV (no row limit)."""
+    u = current_user()
+    if u and u["role"] != "admin":
+        if not auth_system.has_collection_access(u["id"], coll_id, "viewer"):
+            return err("Access denied", 403)
+
+    scopes = None
+    if u and u["role"] != "admin":
+        scopes = auth_system.get_reviewer_scopes(u["id"], coll_id)
+
+    result = db.list_items(
+        coll_id,
+        search            = request.args.get("q", ""),
+        modified_only     = request.args.get("modified_only", "false").lower() == "true",
+        lang_code         = request.args.get("lang") or None,
+        translit_status   = request.args.get("tstatus") or None,
+        ia_collection     = request.args.get("ia_collection") or None,
+        ia_collection_not = request.args.get("ia_collection_not") or None,
+        reviewer_scopes   = scopes,
+        page              = 1,
+        per_page          = 999999,
+        sort              = request.args.get("sort", "title"),
+        sort_dir          = request.args.get("sort_dir", "asc"),
+    )
+
+    coll = db.get_collection(coll_id)
+    coll_name = (coll["name"] if coll else "collection").replace("/", "-")
+    today = datetime.utcnow().strftime("%Y%m%d")
+
+    columns = [
+        "identifier", "title", "alt_title", "creator", "author",
+        "publisher", "year", "language", "detected_language",
+        "collections", "translit_status", "is_modified", "is_pushed",
+        "date", "downloads", "views_30d", "views_7d", "isbn", "subject",
+    ]
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(columns)
+
+    for item in result.get("items", []):
+        row = []
+        for col in columns:
+            val = item.get(col, "")
+            if col == "collections" and isinstance(val, str):
+                val = val.replace("||", "; ")
+            if col in ("is_modified", "is_pushed"):
+                val = "yes" if val else "no"
+            row.append(val if val is not None else "")
+        writer.writerow(row)
+
+    output.seek(0)
+    fname = f"{coll_name}_export_{today}.csv"
+    return send_file(
+        io.BytesIO(output.getvalue().encode("utf-8-sig")),
+        mimetype="text/csv",
+        as_attachment=True,
+        download_name=fname,
     )
 
 

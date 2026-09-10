@@ -503,8 +503,9 @@ CREATE TABLE IF NOT EXISTS reviewer_scopes (
     match_field   TEXT    NOT NULL,
     match_pattern TEXT    NOT NULL,
     match_exact   INTEGER DEFAULT 0,
+    ia_collection TEXT,
     granted_at    TEXT    DEFAULT (datetime('now')),
-    UNIQUE(user_id, collection_id, match_field, match_pattern)
+    UNIQUE(user_id, collection_id, match_field, match_pattern, ia_collection)
 );
 """
 
@@ -625,6 +626,13 @@ def _migrate_legacy(conn):
     conn.commit()
 
 
+def _migrate_reviewer_scopes(conn):
+    """Add ia_collection column to reviewer_scopes if missing."""
+    existing = [r[1] for r in conn.execute("PRAGMA table_info(reviewer_scopes)")]
+    if "ia_collection" not in existing:
+        _safe_add_column(conn, "reviewer_scopes", "ia_collection", "TEXT")
+
+
 def init_db():
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     os.makedirs(COLL_DB_DIR, exist_ok=True)
@@ -634,6 +642,7 @@ def init_db():
         conn.executescript(_CATALOG_SCHEMA_SQL)
         conn.commit()
         _migrate_legacy(conn)
+        _migrate_reviewer_scopes(conn)
         rows = conn.execute("SELECT id, identifier FROM collections").fetchall()
     finally:
         conn.close()
@@ -780,11 +789,40 @@ def get_collections_tree():
             ).fetchall()
         finally:
             conn.close()
+        discovered = {sub["ia_id"]: sub for sub in subs}
         sub_list = []
         for sub in subs:
             d = dict(sub)
             d["local_count"] = _sub_local_count(s["id"], sub["ia_id"])
             sub_list.append(d)
+
+        # Also include collections from item_collections that weren't
+        # discovered via IA — items may belong to sub-collections that
+        # the mediatype:collection query missed.
+        parent_names = {s["identifier"].lower(), s["name"].lower()}
+        conn2 = get_coll_db(s["id"])
+        try:
+            rows = conn2.execute(
+                "SELECT DISTINCT collection FROM item_collections "
+                "WHERE collection NOT LIKE 'fav-%'"
+            ).fetchall()
+        except Exception:
+            rows = []
+        finally:
+            try: conn2.close()
+            except Exception: pass
+        for row in rows:
+            ia_id = row["collection"]
+            if ia_id and ia_id not in discovered \
+                    and ia_id.lower() not in parent_names:
+                count = _sub_local_count(s["id"], ia_id)
+                if count > 0:
+                    sub_list.append({
+                        "id": None, "super_id": s["id"],
+                        "ia_id": ia_id, "name": ia_id,
+                        "local_count": count,
+                    })
+
         entry["sub_collections"] = sub_list
         tree.append(entry)
 
@@ -1161,17 +1199,27 @@ def list_items(collection_id, search=None, modified_only=False,
         params.append(date_reviewed + "%")
     if reviewer_scopes:
         # Build OR conditions for reviewer scope filtering — item must match
-        # at least one scope to be visible
+        # at least one scope to be visible. If a scope has ia_collection,
+        # the item must also belong to that sub-collection.
         or_parts = []
         for scope in reviewer_scopes:
             field = scope["match_field"]
             pattern = scope["match_pattern"]
+            ia_col = scope.get("ia_collection")
             if scope.get("match_exact"):
-                or_parts.append(f"i.{field} = ?")
+                field_clause = f"i.{field} = ?"
                 params.append(pattern)
             else:
-                or_parts.append(f"LOWER(i.{field}) LIKE ?")
+                field_clause = f"LOWER(i.{field}) LIKE ?"
                 params.append("%" + pattern.lower() + "%")
+            if ia_col:
+                or_parts.append(
+                    f"({field_clause} AND i.id IN "
+                    f"(SELECT item_id FROM item_collections WHERE collection = ? COLLATE NOCASE))"
+                )
+                params.append(ia_col)
+            else:
+                or_parts.append(field_clause)
         if or_parts:
             where.append("(" + " OR ".join(or_parts) + ")")
     allowed = {"title", "identifier", "creator", "author", "publisher",
