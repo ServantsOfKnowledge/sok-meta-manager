@@ -628,9 +628,10 @@ async function loadSubCollections() {
   subSelect.innerHTML = '<option value="">All items in collection</option>';
   if (!collId) return;
   try {
-    const r = await api('/api/collections/tree');
-    if (r.ok) {
-      const coll = r.data.find(c => c.id === parseInt(collId));
+    const resp = await fetch('/api/collections/tree', { credentials: 'same-origin' });
+    const data = await resp.json();
+    if (data.ok && Array.isArray(data.data)) {
+      const coll = data.data.find(c => c.id === Number(collId));
       if (coll && coll.sub_collections) {
         coll.sub_collections.forEach(sub => {
           const opt = document.createElement('option');
@@ -641,7 +642,7 @@ async function loadSubCollections() {
       }
     }
   } catch (e) {
-    // ignore
+    console.error('loadSubCollections error:', e);
   }
 }
 
